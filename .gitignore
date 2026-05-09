@@ -8,6 +8,7 @@ __pycache__/
 venv/
 .env
 .DS_Store
+.idea/
 infra/postgres/data/
 infra/postgres/backups/*
 !infra/postgres/backups/.gitkeep
