@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MathMod DataAgent</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        max-width: 960px;
+        margin: 24px auto;
+        padding: 0 16px;
+      }
+      h1 {
+        margin-bottom: 8px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        align-items: stretch;
+      }
+      input,
+      textarea {
+        flex: 1;
+        padding: 10px;
+        font-size: 1rem;
+      }
+      button {
+        padding: 10px 16px;
+        cursor: pointer;
+      }
+      pre {
+        margin: 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      #files {
+        margin-top: 18px;
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 12px;
+        background: #f9f9f9;
+      }
+      .file-content {
+        margin-top: 10px;
+        background: #fff;
+        padding: 10px;
+        border-radius: 4px;
+        max-height: 300px;
+        overflow-y: auto;
+      }
+      #chat {
+        margin-top: 12px;
+        min-height: 120px;
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 12px;
+        background: #fff;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Mathmod Dataagent</h1>
+
+    <div class="row">
+      <textarea id="message" rows="4">
+Найди и подготовь набор данных по динамике ВВП России и Казахстана за 2020-2025 годы.</textarea
+      >
+      <button id="run">Запустить</button>
+    </div>
+
+    <div class="row" style="margin-top: 10px">
+      <input type="file" id="fileInput" />
+      <button id="upload">Загрузить файл</button>
+    </div>
+
+    <div id="files"></div>
+
+    <h2 style="margin-top: 24px">Чат</h2>
+    <div id="chat"></div>
+    <div
+      id="validate-note"
+      style="margin-top: 16px; color: #333; font-size: 0.95rem; display: none"
+    >
+      <strong>Устраивает ли вас ответ?</strong>
+      <button id="validateYes" style="margin-left: 12px">Да</button>
+      <button id="validateNo" style="margin-left: 8px">Нет</button>
+    </div>
+    <div id="clarify-block" style="margin-top: 12px; display: none">
+      <textarea
+        id="clarification"
+        rows="3"
+        style="width: 100%; padding: 8px; font-size: 0.95rem"
+        placeholder="Уточните, что именно неправильно или чего вам не хватает"
+      ></textarea>
+      <button id="clarifySend" style="margin-top: 6px">
+        Отправить уточнение
+      </button>
+    </div>
+
+    <script>
+      const filesDiv = document.getElementById("files");
+      const chatDiv = document.getElementById("chat");
+      const validateNote = document.getElementById("validate-note");
+      const clarifyBlock = document.getElementById("clarify-block");
+      const clarificationInput = document.getElementById("clarification");
+      const messageInput = document.getElementById("message");
+      let conversationId = null;
+      let source = null;
+      let dialog = [];
+
+      function escapeHtml(text) {
+        return text
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#039;");
+      }
+
+      function renderChat(dialog) {
+        chatDiv.innerHTML = (dialog || [])
+          .map(
+            (item) => `
+          <div style="margin-bottom:10px; padding:10px; border-radius:6px; background:${
+            item.role === "user" ? "#eef" : "#f9f9f9"
+          }; border:1px solid ${item.role === "user" ? "#88a" : "#ddd"};">
+            <strong>${item.role === "user" ? "Запрос" : "Ответ"}</strong>
+            <div style="margin-top:6px; white-space:pre-wrap;">${escapeHtml(
+              item.content
+            )}</div>
+          </div>
+        `
+          )
+          .join("");
+      }
+
+      function closeStream() {
+        if (source) {
+          source.close();
+          source = null;
+        }
+      }
+
+      function showValidation() {
+        validateNote.style.display = "block";
+        clarifyBlock.style.display = "none";
+      }
+
+      function hideValidation() {
+        validateNote.style.display = "none";
+        clarifyBlock.style.display = "none";
+      }
+
+      function runQuery(message, { clarify = false } = {}) {
+        closeStream();
+        hideValidation();
+
+        const baseUrl = clarify ? "/invoke/clarify/stream" : "/invoke/stream";
+        const params = new URLSearchParams({ message });
+        if (conversationId) params.set("conversation_id", conversationId);
+        source = new EventSource(`${baseUrl}?${params.toString()}`);
+
+        let assistantIndex = null;
+
+        // Update local dialog immediately so chat feels responsive.
+        if (clarify) {
+          if (dialog.length >= 2) {
+            dialog[dialog.length - 2] = { role: "user", content: message };
+            dialog[dialog.length - 1] = { role: "assistant", content: "" };
+            assistantIndex = dialog.length - 1;
+          } else {
+            dialog.push({ role: "user", content: message });
+            dialog.push({ role: "assistant", content: "" });
+            assistantIndex = dialog.length - 1;
+          }
+        } else {
+          dialog.push({ role: "user", content: message });
+          dialog.push({ role: "assistant", content: "" });
+          assistantIndex = dialog.length - 1;
+        }
+        renderChat(dialog);
+
+        source.addEventListener("meta", (event) => {
+          try {
+            const data = JSON.parse(event.data || "{}");
+            if (data.conversation_id) conversationId = data.conversation_id;
+          } catch {
+            // ignore
+          }
+        });
+
+        source.addEventListener("delta", (event) => {
+          if (assistantIndex == null) return;
+          try {
+            const data = JSON.parse(event.data || "{}");
+            const chunk = data.text || "";
+            dialog[assistantIndex].content += chunk;
+            renderChat(dialog);
+          } catch {
+            // ignore
+          }
+        });
+
+        source.addEventListener("done", () => {
+          closeStream();
+          showValidation();
+        });
+
+        source.onerror = async () => {
+          closeStream();
+          chatDiv.innerHTML = `<div style="color:#b00;">Ошибка: соединение оборвалось.</div>`;
+        };
+      }
+
+      document.getElementById("run").addEventListener("click", () => {
+        const text = messageInput.value.trim();
+        if (!text) return;
+        runQuery(text);
+      });
+
+      document.getElementById("validateYes").addEventListener("click", () => {
+        hideValidation();
+        clarificationInput.value = "";
+      });
+
+      document.getElementById("validateNo").addEventListener("click", () => {
+        hideValidation();
+        clarifyBlock.style.display = "block";
+        clarificationInput.focus();
+      });
+
+      document.getElementById("clarifySend").addEventListener("click", () => {
+        const clarification = clarificationInput.value.trim();
+        if (!clarification) return;
+        clarificationInput.value = "";
+        clarifyBlock.style.display = "none";
+        runQuery(clarification, { clarify: true });
+      });
+
+      function displayFile(fileData) {
+        const div = document.createElement("div");
+        div.innerHTML = `<h3>Файл: ${
+          fileData.filename
+        }</h3><div class="file-content"><pre>${escapeHtml(
+          fileData.content
+        )}</pre></div>`;
+        filesDiv.appendChild(div);
+      }
+
+      document.getElementById("upload").addEventListener("click", () => {
+        const fileInput = document.getElementById("fileInput");
+        const file = fileInput.files[0];
+        if (!file) return;
+        const formData = new FormData();
+        formData.append("file", file);
+        fetch("/invoke/upload_from_agent", {
+          method: "POST",
+          body: formData,
+        })
+          .then((response) => response.json())
+          .then(displayFile)
+          .catch((error) => console.error("Upload error:", error));
+      });
+    </script>
+  </body>
+</html>
