@@ -1,0 +1,59 @@
+name: matmod-rag
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: matmod-rag-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-matmod_rag}
+      POSTGRES_USER: ${POSTGRES_USER:-matmod}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-matmod_password}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ./infra/postgres/data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./infra/postgres/backups:/backups
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  agents:
+    build:
+      context: ./agents
+    container_name: matmod-rag-agents
+    profiles:
+      - agents
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-matmod}:${POSTGRES_PASSWORD:-matmod_password}@postgres:5432/${POSTGRES_DB:-matmod_rag}
+      YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}
+      YANDEX_API_KEY: ${YANDEX_API_KEY:-}
+      YANDEX_LLM_BASE_URL: ${YANDEX_LLM_BASE_URL:-https://llm.api.cloud.yandex.net/v1}
+      YANDEX_CHAT_MODEL: ${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}
+    stdin_open: true
+    tty: true
+
+  backend:
+    build:
+      context: ./backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AGENT_SERVICE_URL: ${AGENT_SERVICE_URL:-http://host.docker.internal:8001}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-matmod}:${POSTGRES_PASSWORD:-matmod_password}@postgres:5432/${POSTGRES_DB:-matmod_rag}
+      MOCK_MODE: ${MOCK_MODE:-true}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
