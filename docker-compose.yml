@@ -26,16 +26,19 @@ services:
     build:
       context: ./agents
     container_name: matmod-rag-agents
-    profiles:
-      - agents
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-matmod}:${POSTGRES_PASSWORD:-matmod_password}@postgres:5432/${POSTGRES_DB:-matmod_rag}
       YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}
       YANDEX_API_KEY: ${YANDEX_API_KEY:-}
       YANDEX_LLM_BASE_URL: ${YANDEX_LLM_BASE_URL:-https://llm.api.cloud.yandex.net/v1}
       YANDEX_CHAT_MODEL: ${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}
-    stdin_open: true
-    tty: true
+    ports:
+      - "${AGENT_SERVICE_PORT:-8001}:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   backend:
     build:
@@ -43,10 +46,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      agents:
+        condition: service_healthy
     environment:
-      AGENT_SERVICE_URL: ${AGENT_SERVICE_URL:-http://host.docker.internal:8001}
+      AGENT_SERVICE_URL: ${AGENT_SERVICE_URL:-http://agents:8001}
       DATABASE_URL: postgresql://${POSTGRES_USER:-matmod}:${POSTGRES_PASSWORD:-matmod_password}@postgres:5432/${POSTGRES_DB:-matmod_rag}
-      MOCK_MODE: ${MOCK_MODE:-true}
+      MOCK_MODE: ${MOCK_MODE:-false}
     ports:
       - "${BACKEND_PORT:-8000}:8000"
 

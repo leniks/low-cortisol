@@ -1,3 +1,6 @@
 openai
 openai-agents
 python-dotenv
+fastapi
+uvicorn
+pydantic

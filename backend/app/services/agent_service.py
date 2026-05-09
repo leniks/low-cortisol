@@ -10,9 +10,17 @@ from app.core.settings import Settings
 class AgentService:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._client = httpx.AsyncClient(base_url=self._settings.agent_service_url, timeout=30.0)
+        self._client = httpx.AsyncClient(
+            base_url=self._settings.agent_service_url,
+            timeout=httpx.Timeout(120.0, connect=10.0),
+        )
 
-    async def run_stream(self, user_query: str, conversation_id: str | None = None) -> AsyncGenerator[dict[str, Any], None]:
+    async def run_stream(
+        self,
+        user_query: str,
+        conversation_id: str | None = None,
+        history: list[dict[str, str]] | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
         if self._settings.mock_mode:
             thought = "Анализирую запрос и подготавливаю набор данных."
             thought_parts = [thought[i : i + 25] for i in range(0, len(thought), 25)]
@@ -28,11 +36,13 @@ class AgentService:
             return
 
         url = "/invoke/stream"
-        params = {"message": user_query}
-        if conversation_id:
-            params["conversation_id"] = conversation_id
+        payload = {
+            "message": user_query,
+            "conversation_id": conversation_id,
+            "history": history or [],
+        }
 
-        async with self._client.stream("GET", url, params=params) as response:
+        async with self._client.stream("POST", url, json=payload) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
                 if line.startswith("data: "):

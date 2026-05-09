@@ -10,10 +10,12 @@ API-прослойка для стриминга к внешнему AgentServic
 - `backend/app/services/agent_service.py` — прокси к внешнему AgentService
 - `backend/app/schemas/invoke.py` — Pydantic-схемы для запроса/ответа
 - `backend/app/core/settings.py` — конфигурация через env
-- `agents/` — CLI-сервис с агентом
-- `agents/main.py` — консольный агент через OpenAI Agents SDK и Yandex LLM-compatible API
-- `frontend/` — статический фронтенд
-- `frontend/index.html` — UI с чатом и загрузкой файлов
+- `agents/` — HTTP Agent Service с основным агентом
+- `agents/app/main.py` — FastAPI приложение Agent Service
+- `agents/main.py` — консольный entrypoint для ручной проверки основного агента
+- `frontend/` — React + Tailwind фронтенд
+- `frontend/src/` — UI чата, клиентские сессии и localStorage-история
+- `frontend/index.html` — Vite entrypoint
 - `frontend/nginx.conf` — nginx-конфиг для отдачи фронтенда и проксирования API
 - `infra/postgres/init/001_enable_pgvector.sql` — включение расширения `pgvector`
 - `infra/postgres/backups/` — место для дампов/бэкапов Postgres
@@ -22,7 +24,7 @@ API-прослойка для стриминга к внешнему AgentServic
 ## Docker
 
 ```bash
-docker compose up --build
+docker compose up
 ```
 
 Для локальной настройки можно создать `.env` из примера:
@@ -38,20 +40,25 @@ cp .env.example .env
 - Postgres доступен на `localhost:5432`
 - фронтенд проксирует `/invoke` и `/health` в контейнер `backend`
 - внутри Docker бэкенд подключается к Postgres по `DATABASE_URL=postgresql://matmod:matmod_password@postgres:5432/matmod_rag`
+- внутри Docker бэкенд вызывает Agent Service по `AGENT_SERVICE_URL=http://agents:8001`
 
 Порты и режим можно переопределить через переменные:
 
 ```bash
-FRONTEND_PORT=3000 BACKEND_PORT=8000 POSTGRES_PORT=5433 MOCK_MODE=false AGENT_SERVICE_URL=http://host.docker.internal:8001 docker compose up --build
+FRONTEND_PORT=3000 BACKEND_PORT=8000 POSTGRES_PORT=5433 AGENT_SERVICE_PORT=8001 MOCK_MODE=false docker compose up
 ```
 
-Агентский CLI запускается отдельным compose-сервисом:
+Compose сам соберёт frontend/backend/agents образы на машине, где их ещё нет. Для принудительной пересборки после изменения кода можно использовать `docker compose up --build`.
+
+Для реального основного агента нужен `YANDEX_API_KEY` в `.env`. Без него Agent Service поднимется, но запросы к агенту вернут ошибку конфигурации.
+
+Агентский CLI для ручной проверки можно запустить так:
 
 ```bash
-docker compose --profile agents run --rm agents
+docker compose run --rm agents python main.py
 ```
 
-Для него нужен `YANDEX_API_KEY` в `.env`.
+Для CLI тоже нужен `YANDEX_API_KEY` в `.env`.
 
 ## Postgres и вектора
 
@@ -94,10 +101,10 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ## Конфигурация
 
-- `AGENT_SERVICE_URL` — URL внешнего AgentService (по умолчанию `http://localhost:8001`)
-- `MOCK_MODE` — если `True`, работает в моковом режиме без внешних вызовов
+- `AGENT_SERVICE_URL` — URL Agent Service (в Docker по умолчанию `http://agents:8001`)
+- `MOCK_MODE` — если `True`, backend работает в моковом режиме без вызова Agent Service
 - `YANDEX_FOLDER_ID` — folder id Yandex Cloud для агентского CLI
-- `YANDEX_API_KEY` — API key Yandex Cloud для агентского CLI
+- `YANDEX_API_KEY` — API key Yandex Cloud для Agent Service и CLI
 - `YANDEX_LLM_BASE_URL` — OpenAI-compatible endpoint Yandex LLM
 - `YANDEX_CHAT_MODEL` — модель для `agents/main.py`
 
