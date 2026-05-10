@@ -4,7 +4,14 @@ from fastapi import APIRouter, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
 
 from app.dependencies import get_agent_service, get_dialog_store
-from app.schemas.invoke import InvokeRequest, InvokeResponse
+from app.schemas.invoke import (
+    ClarificationResult,
+    ClassifyRequest,
+    DialogStateRequest,
+    InvokeRequest,
+    InvokeResponse,
+    RagRouteDecision,
+)
 from app.utils.sse import to_sse_data
 
 router = APIRouter(prefix="/invoke", tags=["invoke"])
@@ -25,6 +32,7 @@ async def _stream_chat_answer(
     message: str,
     conversation_id: str,
     replace_last: bool,
+    route_decision: RagRouteDecision | None = None,
 ) -> AsyncGenerator[str, None]:
     agent_service = get_agent_service()
     dialog_store = get_dialog_store()
@@ -34,7 +42,12 @@ async def _stream_chat_answer(
 
     final_parts: list[str] = []
     history = _history_payload(conversation_id)
-    async for event in agent_service.run_stream(message, conversation_id=conversation_id, history=history):
+    async for event in agent_service.run_stream(
+        message,
+        conversation_id=conversation_id,
+        history=history,
+        route_decision=route_decision.model_dump() if route_decision else None,
+    ):
         if event.get("type") != "final":
             continue
         chunk = str(event.get("text", ""))
@@ -74,6 +87,39 @@ async def invoke(body: InvokeRequest) -> InvokeResponse:
     )
 
 
+@router.post("/classify", response_model=RagRouteDecision)
+async def classify(body: ClassifyRequest) -> RagRouteDecision:
+    agent_service = get_agent_service()
+    dialog_store = get_dialog_store()
+
+    conversation_id = dialog_store.ensure_conversation_id(body.conversation_id)
+    history = _history_payload(conversation_id)
+    decision = await agent_service.classify(body.message, conversation_id=conversation_id, history=history)
+    return RagRouteDecision.model_validate(decision)
+
+
+@router.post("/clarify-missing", response_model=ClarificationResult)
+async def clarify_missing(body: ClassifyRequest) -> ClarificationResult:
+    agent_service = get_agent_service()
+    dialog_store = get_dialog_store()
+
+    conversation_id = dialog_store.ensure_conversation_id(body.conversation_id)
+    history = _history_payload(conversation_id)
+    result = await agent_service.clarify_missing(body.message, conversation_id=conversation_id, history=history)
+    return ClarificationResult.model_validate(result)
+
+
+@router.post("/dialog", response_model=InvokeResponse)
+async def set_dialog(body: DialogStateRequest) -> InvokeResponse:
+    dialog_store = get_dialog_store()
+    dialog_store.set(body.conversation_id, body.dialog)
+    return InvokeResponse(
+        conversation_id=body.conversation_id,
+        answer=body.dialog[-1].content if body.dialog else "",
+        dialog=dialog_store.get(body.conversation_id),
+    )
+
+
 @router.post("/clarify", response_model=InvokeResponse)
 async def clarify(body: InvokeRequest) -> InvokeResponse:
     agent_service = get_agent_service()
@@ -100,11 +146,23 @@ async def clarify(body: InvokeRequest) -> InvokeResponse:
 async def invoke_stream(
     message: str = Query(..., min_length=2),
     conversation_id: str | None = Query(None),
+    route_decision: str | None = Query(None),
+    route_needs_rag: bool | None = Query(None),
+    route_confidence: float | None = Query(None),
+    route_reason: str | None = Query(None),
 ) -> StreamingResponse:
     dialog_store = get_dialog_store()
     cid = dialog_store.ensure_conversation_id(conversation_id)
+    approved_route = None
+    if route_decision and route_needs_rag is not None and route_confidence is not None and route_reason:
+        approved_route = RagRouteDecision(
+            decision=route_decision,
+            needs_rag=route_needs_rag,
+            confidence=route_confidence,
+            reason=route_reason,
+        )
     return StreamingResponse(
-        _stream_chat_answer(message=message, conversation_id=cid, replace_last=False),
+        _stream_chat_answer(message=message, conversation_id=cid, replace_last=False, route_decision=approved_route),
         media_type="text/event-stream",
     )
 

@@ -107,6 +107,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - `YANDEX_API_KEY` — API key Yandex Cloud для Agent Service и CLI
 - `YANDEX_LLM_BASE_URL` — OpenAI-compatible endpoint Yandex LLM
 - `YANDEX_CHAT_MODEL` — модель для `agents/main.py`
+- `YANDEX_CLASSIFIER_MODEL` — отдельная модель классификатора, который решает, нужен ли RAG
+- `YANDEX_CLARIFIER_MODEL` — отдельная модель уточнений, которая проверяет, хватает ли параметров запроса
 
 ## API
 

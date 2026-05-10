@@ -32,6 +32,8 @@ services:
       YANDEX_API_KEY: ${YANDEX_API_KEY:-}
       YANDEX_LLM_BASE_URL: ${YANDEX_LLM_BASE_URL:-https://llm.api.cloud.yandex.net/v1}
       YANDEX_CHAT_MODEL: ${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}
+      YANDEX_CLASSIFIER_MODEL: ${YANDEX_CLASSIFIER_MODEL:-${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}}
+      YANDEX_CLARIFIER_MODEL: ${YANDEX_CLARIFIER_MODEL:-${YANDEX_CLASSIFIER_MODEL:-${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}}}
     ports:
       - "${AGENT_SERVICE_PORT:-8001}:8001"
     healthcheck:

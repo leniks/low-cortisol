@@ -1,18 +1,25 @@
 import {
-  Check,
+  Copy,
   Menu,
   MessageSquarePlus,
-  PanelLeftClose,
-  PanelLeftOpen,
   PenLine,
+  Search,
   Send,
   Trash2,
   X,
 } from "lucide-react";
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
-import { createChatStreamUrl } from "./chatApi";
+import { clarifyMissing, createChatStreamUrl, syncDialog } from "./chatApi";
 import { loadChatState, saveChatState } from "./storage";
-import type { ChatMessage, ChatSession, PersistedChatState, SendMode } from "./types";
+import type {
+  ChatCheckpoint,
+  ChatMessage,
+  ChatSession,
+  ClarificationOption,
+  PendingClarification,
+  PersistedChatState,
+  SendMode,
+} from "./types";
 
 const firstPrompt = "Найди и подготовь набор данных по динамике ВВП России и Казахстана за 2020-2025 годы.";
 
@@ -50,13 +57,39 @@ function getSessionPreview(session: ChatSession): string {
   return lastMessage?.content.trim() || "Пустой диалог";
 }
 
+function cloneMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((message) => ({
+    ...message,
+    clarification: message.clarification ? cloneClarification(message.clarification) : undefined,
+  }));
+}
+
+function cloneClarification(clarification: NonNullable<ChatMessage["clarification"]>): NonNullable<ChatMessage["clarification"]> {
+  return {
+    ...clarification,
+    missing_fields: [...clarification.missing_fields],
+    options: clarification.options.map((option) => ({ ...option })),
+  };
+}
+
+function formatCheckpointTitle(checkpoint: ChatCheckpoint, index: number): string {
+  return `${index + 1}. ${checkpoint.title}`;
+}
+
+function appendClarificationValue(message: string, value: string): string {
+  const normalized = message.trim();
+  if (!normalized) return value;
+  return `${normalized}, ${value}`;
+}
+
 function App() {
   const [chatState, setChatState] = useState<PersistedChatState>(() => loadChatState());
   const [input, setInput] = useState("");
   const [mode, setMode] = useState<SendMode>("normal");
   const [streamingSessionId, setStreamingSessionId] = useState<string | null>(null);
+  const [clarifyingSessionId, setClarifyingSessionId] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [desktopSidebarCollapsed, setDesktopSidebarCollapsed] = useState(false);
+  const [sessionFilter, setSessionFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
   const sourceRef = useRef<EventSource | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -67,14 +100,12 @@ function App() {
     [chatState.activeSessionId, chatState.sessions],
   );
 
-  const isStreaming = Boolean(streamingSessionId);
+  const isClarifying = Boolean(clarifyingSessionId);
+  const isStreaming = Boolean(streamingSessionId || clarifyingSessionId);
   const latestAssistantMessage = [...(activeSession?.messages ?? [])]
     .reverse()
     .find((message) => message.role === "assistant");
-  const canShowFeedback =
-    Boolean(latestAssistantMessage?.content.trim()) &&
-    !isStreaming &&
-    activeSession?.feedbackHiddenForMessageId !== latestAssistantMessage?.id;
+  const canShowCopy = Boolean(latestAssistantMessage?.content.trim()) && !isStreaming;
 
   useEffect(() => {
     saveChatState(chatState);
@@ -164,13 +195,45 @@ function App() {
     );
   }
 
+  function updateAssistantClarification(
+    sessionId: string,
+    assistantMessageId: string,
+    clarification: ChatMessage["clarification"],
+    status: ChatMessage["clarificationStatus"],
+  ): void {
+    updateSessions((sessions) =>
+      sessions.map((session) => {
+        if (session.id !== sessionId) return session;
+        return {
+          ...session,
+          updatedAt: nowIso(),
+          messages: session.messages.map((message) =>
+            message.id === assistantMessageId ? { ...message, clarification, clarificationStatus: status } : message,
+          ),
+        };
+      }),
+    );
+  }
+
+  function setPendingClarification(sessionId: string, pendingClarification: PendingClarification | undefined): void {
+    updateSessions((sessions) =>
+      sessions.map((session) =>
+        session.id === sessionId ? { ...session, pendingClarification, updatedAt: nowIso() } : session,
+      ),
+    );
+  }
+
   function updateConversationId(sessionId: string, conversationId: string): void {
     updateSessions((sessions) =>
       sessions.map((session) => (session.id === sessionId ? { ...session, conversationId } : session)),
     );
   }
 
-  function stageOutgoingMessages(session: ChatSession, message: string, sendMode: SendMode): ChatMessage {
+  function stageOutgoingMessages(
+    session: ChatSession,
+    message: string,
+    sendMode: SendMode,
+  ): { userMessage: ChatMessage; assistantMessage: ChatMessage } {
     const timestamp = nowIso();
     const userMessage: ChatMessage = {
       id: createId(),
@@ -203,16 +266,20 @@ function App() {
           ...item,
           title: item.messages.length === 0 ? titleFromMessage(message) : item.title,
           updatedAt: timestamp,
-          feedbackHiddenForMessageId: undefined,
           messages,
         };
       }),
     );
 
-    return assistantMessage;
+    return { userMessage, assistantMessage };
   }
 
-  function startStream(session: ChatSession, message: string, assistantMessageId: string, sendMode: SendMode): void {
+  function startStream(
+    session: ChatSession,
+    message: string,
+    assistantMessageId: string,
+    sendMode: SendMode,
+  ): void {
     closeCurrentStream();
     setError(null);
     setStreamingSessionId(session.id);
@@ -253,16 +320,147 @@ function App() {
     };
   }
 
-  function sendMessage(event?: FormEvent): void {
+  async function clarifyBeforeNextStep(
+    session: ChatSession,
+    message: string,
+    sendMode: SendMode,
+    userMessageId: string,
+    assistantMessageId: string,
+  ): Promise<void> {
+    setClarifyingSessionId(session.id);
+    setError(null);
+
+    try {
+      const clarification = await clarifyMissing(message, session.conversationId);
+      if (clarification.is_complete) {
+        startStream(session, message, assistantMessageId, sendMode);
+        return;
+      }
+
+      updateAssistantClarification(session.id, assistantMessageId, clarification, "pending");
+      setPendingClarification(session.id, {
+        id: createId(),
+        message,
+        sendMode,
+        assistantMessageId,
+        userMessageId,
+        clarification,
+        createdAt: nowIso(),
+      });
+    } catch {
+      setError("Не удалось уточнить запрос. Попробуйте отправить сообщение еще раз.");
+      appendAssistantChunk(session.id, assistantMessageId, "\n\n[Ошибка уточнения]");
+    } finally {
+      setClarifyingSessionId(null);
+    }
+  }
+
+  function chooseClarificationOption(option: ClarificationOption): void {
+    if (!activeSession?.pendingClarification || isStreaming) return;
+
+    const pending = activeSession.pendingClarification;
+    if (option.value === "manual") {
+      updateSessions((sessions) =>
+        sessions.map((session) => {
+          if (session.id !== activeSession.id) return session;
+          return {
+            ...session,
+            updatedAt: nowIso(),
+            pendingClarification: undefined,
+            messages: session.messages.filter(
+              (message) => message.id !== pending.userMessageId && message.id !== pending.assistantMessageId,
+            ),
+          };
+        }),
+      );
+      setInput(pending.message);
+      setMode(pending.sendMode);
+      requestAnimationFrame(() => textareaRef.current?.focus());
+      return;
+    }
+
+    const clarifiedMessage = appendClarificationValue(pending.message, option.value);
+    const timestamp = nowIso();
+
+    updateSessions((sessions) =>
+      sessions.map((session) => {
+        if (session.id !== activeSession.id) return session;
+
+        const messages = session.messages.map((message) =>
+          message.id === pending.userMessageId
+            ? { ...message, content: clarifiedMessage }
+            : message.id === pending.assistantMessageId
+              ? { ...message, clarification: pending.clarification, clarificationStatus: "answered" as const }
+              : message,
+        );
+        const checkpoint: ChatCheckpoint = {
+          id: pending.id,
+          title: `${pending.clarification.question || "Уточнение"}: ${option.label}`,
+          createdAt: timestamp,
+          pendingClarification: { ...pending, clarification: cloneClarification(pending.clarification) },
+          messages: cloneMessages(activeSession.messages),
+        };
+
+        return {
+          ...session,
+          updatedAt: timestamp,
+          pendingClarification: undefined,
+          checkpoints: [...(session.checkpoints ?? []), checkpoint],
+          messages,
+        };
+      }),
+    );
+
+    startStream(activeSession, clarifiedMessage, pending.assistantMessageId, pending.sendMode);
+  }
+
+  function rollbackToCheckpoint(checkpointId: string): void {
+    if (!activeSession || isStreaming) return;
+    const checkpoints = activeSession.checkpoints ?? [];
+    const checkpointIndex = checkpoints.findIndex((item) => item.id === checkpointId);
+    const checkpoint = checkpointIndex >= 0 ? checkpoints[checkpointIndex] : undefined;
+    const pendingClarification = checkpoint?.pendingClarification;
+    if (!checkpoint || !pendingClarification) return;
+    const restoredMessages = cloneMessages(checkpoint.messages);
+    const restoredCheckpoints = checkpoints.slice(0, checkpointIndex);
+
+    updateSessions((sessions) =>
+      sessions.map((session) =>
+        session.id === activeSession.id
+          ? {
+              ...session,
+              updatedAt: nowIso(),
+              checkpoints: restoredCheckpoints,
+              pendingClarification: {
+                ...pendingClarification,
+                clarification: cloneClarification(pendingClarification.clarification),
+              },
+              messages: restoredMessages,
+            }
+          : session,
+      ),
+    );
+    void syncDialog(activeSession.conversationId, restoredMessages).catch(() => {
+      setError("Откат применён локально, но backend-историю синхронизировать не удалось.");
+    });
+  }
+
+  async function sendMessage(event?: FormEvent): Promise<void> {
     event?.preventDefault();
     const message = input.trim();
     if (!message || isStreaming) return;
 
     const session = ensureActiveSession();
     const sendMode = mode;
-    const assistantMessage = stageOutgoingMessages(session, message, sendMode);
+    const { userMessage, assistantMessage } = stageOutgoingMessages(session, message, sendMode);
     setInput("");
     setMode("normal");
+
+    if (sendMode === "normal") {
+      await clarifyBeforeNextStep(session, message, sendMode, userMessage.id, assistantMessage.id);
+      return;
+    }
+
     startStream(session, message, assistantMessage.id, sendMode);
   }
 
@@ -279,86 +477,64 @@ function App() {
     }
   }
 
-  function acceptAnswer(): void {
-    if (!activeSession || !latestAssistantMessage) return;
-    updateSessions((sessions) =>
-      sessions.map((session) =>
-        session.id === activeSession.id
-          ? { ...session, feedbackHiddenForMessageId: latestAssistantMessage.id }
-          : session,
-      ),
-    );
+  function copyLatestAnswer(): void {
+    if (!latestAssistantMessage?.content.trim()) return;
+    void navigator.clipboard?.writeText(latestAssistantMessage.content);
   }
 
-  function beginClarification(): void {
-    if (!activeSession || isStreaming) return;
-    setMode("clarify");
-    setInput("");
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  }
-
-  const sessionList = chatState.sessions;
+  const normalizedSessionFilter = sessionFilter.trim().toLowerCase();
+  const sessionList = normalizedSessionFilter
+    ? chatState.sessions.filter((session) => {
+        const haystack = `${session.title} ${getSessionPreview(session)}`.toLowerCase();
+        return haystack.includes(normalizedSessionFilter);
+      })
+    : chatState.sessions;
 
   return (
-    <div className="min-h-screen bg-[#f6f7f9] text-neutral-950">
+    <div className="min-h-screen bg-white text-neutral-950">
       <div className="flex min-h-screen">
         <aside
           className={cx(
-            "fixed inset-y-0 left-0 z-30 w-[300px] border-r border-neutral-200 bg-[#eceff3] transition-transform duration-200 lg:sticky lg:top-0 lg:z-auto lg:h-screen",
+            "fixed inset-y-0 left-0 z-30 w-[260px] border-r border-neutral-200 bg-[#f7f7f8] transition-transform duration-200 lg:sticky lg:top-0 lg:z-auto lg:h-screen",
             sidebarOpen ? "translate-x-0" : "-translate-x-full lg:translate-x-0",
-            desktopSidebarCollapsed && "lg:w-[74px]",
           )}
         >
           <div className="flex h-full flex-col">
-            <div className="flex h-16 items-center gap-2 border-b border-neutral-200 px-3">
+            <div className="space-y-1 px-3 py-4">
               <button
                 type="button"
-                className="grid h-10 w-10 shrink-0 place-items-center rounded-lg text-neutral-700 transition hover:bg-white/75"
-                onClick={() => setDesktopSidebarCollapsed((value) => !value)}
-                aria-label={desktopSidebarCollapsed ? "Развернуть боковую панель" : "Свернуть боковую панель"}
-                title={desktopSidebarCollapsed ? "Развернуть" : "Свернуть"}
-              >
-                {desktopSidebarCollapsed ? <PanelLeftOpen size={20} /> : <PanelLeftClose size={20} />}
-              </button>
-              {!desktopSidebarCollapsed && (
-                <>
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm font-semibold">MathMod DataAgent</div>
-                    <div className="truncate text-xs text-neutral-500">Локальная история</div>
-                  </div>
-                  <button
-                    type="button"
-                    className="grid h-10 w-10 shrink-0 place-items-center rounded-lg text-neutral-700 transition hover:bg-white/75 lg:hidden"
-                    onClick={() => setSidebarOpen(false)}
-                    aria-label="Закрыть боковую панель"
-                    title="Закрыть"
-                  >
-                    <X size={19} />
-                  </button>
-                </>
-              )}
-            </div>
-
-            <div className="p-3">
-              <button
-                type="button"
-                className={cx(
-                  "flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-neutral-950 px-3 text-sm font-medium text-white transition hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-55",
-                  desktopSidebarCollapsed && "lg:px-0",
-                )}
+                className="flex h-9 w-full items-center gap-3 rounded-lg px-3 text-left text-sm text-neutral-900 transition hover:bg-neutral-200/70 disabled:cursor-not-allowed disabled:opacity-55"
                 onClick={createNewChat}
                 disabled={isStreaming}
-                title="Новый чат"
               >
-                <MessageSquarePlus size={18} />
-                {!desktopSidebarCollapsed && <span>Новый чат</span>}
+                <PenLine size={18} />
+                <span>Новый чат</span>
+              </button>
+              <label className="flex h-9 w-full items-center gap-3 rounded-lg px-3 text-sm text-neutral-700 transition focus-within:bg-neutral-200/70 hover:bg-neutral-200/70">
+                <Search size={18} />
+                <input
+                  className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-neutral-500"
+                  value={sessionFilter}
+                  onChange={(event) => setSessionFilter(event.target.value)}
+                  placeholder="Поиск в чатах"
+                />
+              </label>
+              <button
+                type="button"
+                className="flex h-9 w-full items-center gap-3 rounded-lg px-3 text-left text-sm text-neutral-900 transition hover:bg-neutral-200/70 lg:hidden"
+                onClick={() => setSidebarOpen(false)}
+              >
+                <X size={18} />
+                <span>Закрыть меню</span>
               </button>
             </div>
 
             <div className="flex-1 overflow-y-auto px-2 pb-4">
-              {sessionList.length === 0 && !desktopSidebarCollapsed && (
-                <div className="mx-2 mt-2 rounded-lg border border-dashed border-neutral-300 px-3 py-4 text-sm text-neutral-500">
-                  История появится после первого сообщения.
+              <div className="px-2 pb-2 pt-3 text-sm font-semibold text-neutral-800">Недавнее</div>
+
+              {sessionList.length === 0 && (
+                <div className="mx-2 rounded-lg border border-dashed border-neutral-300 px-3 py-4 text-sm text-neutral-500">
+                  {chatState.sessions.length === 0 ? "История появится после первого сообщения." : "Ничего не найдено."}
                 </div>
               )}
 
@@ -370,155 +546,220 @@ function App() {
                       <button
                         type="button"
                         className={cx(
-                          "flex min-h-14 w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition",
-                          selected ? "bg-white shadow-sm" : "hover:bg-white/65",
-                          desktopSidebarCollapsed && "lg:justify-center lg:px-0",
+                          "flex min-h-9 w-full items-center rounded-lg px-3 py-2 text-left text-sm transition",
+                          selected ? "bg-neutral-200 text-neutral-950" : "text-neutral-800 hover:bg-neutral-200/70",
                         )}
                         onClick={() => selectSession(session.id)}
                         disabled={isStreaming}
                         title={session.title}
                       >
-                        <span
-                          className={cx(
-                            "grid h-8 w-8 shrink-0 place-items-center rounded-lg",
-                            selected ? "bg-emerald-100 text-emerald-800" : "bg-neutral-200 text-neutral-600",
-                          )}
-                        >
-                          <PenLine size={16} />
+                        <span className="min-w-0 flex-1 pr-8">
+                          <span className="block truncate">{session.title}</span>
                         </span>
-                        {!desktopSidebarCollapsed && (
-                          <span className="min-w-0 flex-1 pr-8">
-                            <span className="block truncate text-sm font-medium">{session.title}</span>
-                            <span className="block truncate text-xs text-neutral-500">{getSessionPreview(session)}</span>
-                          </span>
-                        )}
+                        {selected && <span className="h-2 w-2 rounded-full bg-sky-500" />}
                       </button>
-                      {!desktopSidebarCollapsed && (
-                        <button
-                          type="button"
-                          className="absolute right-2 top-1/2 hidden h-8 w-8 -translate-y-1/2 place-items-center rounded-lg text-neutral-400 transition hover:bg-rose-50 hover:text-rose-700 group-hover:grid"
-                          onClick={() => deleteSession(session.id)}
-                          disabled={isStreaming}
-                          aria-label="Удалить диалог"
-                          title="Удалить"
-                        >
-                          <Trash2 size={16} />
-                        </button>
-                      )}
+                      <button
+                        type="button"
+                        className="absolute right-2 top-1/2 hidden h-7 w-7 -translate-y-1/2 place-items-center rounded-md text-neutral-500 transition hover:bg-white hover:text-rose-600 group-hover:grid"
+                        onClick={() => deleteSession(session.id)}
+                        disabled={isStreaming}
+                        aria-label="Удалить диалог"
+                        title="Удалить"
+                      >
+                        <Trash2 size={15} />
+                      </button>
                     </div>
                   );
                 })}
               </div>
             </div>
+
           </div>
         </aside>
 
         {sidebarOpen && (
           <button
             type="button"
-            className="fixed inset-0 z-20 bg-neutral-950/35 lg:hidden"
+            className="fixed inset-0 z-20 bg-neutral-950/25 lg:hidden"
             onClick={() => setSidebarOpen(false)}
             aria-label="Закрыть боковую панель"
           />
         )}
 
-        <main className="flex min-h-screen min-w-0 flex-1 flex-col">
-          <header className="sticky top-0 z-10 flex h-16 items-center gap-3 border-b border-neutral-200 bg-[#f6f7f9]/95 px-4 backdrop-blur">
+        <main className="flex min-h-screen min-w-0 flex-1 flex-col bg-white">
+          <header className="sticky top-0 z-10 flex h-16 items-center gap-3 bg-white/90 px-4 backdrop-blur">
             <button
               type="button"
-              className="grid h-10 w-10 place-items-center rounded-lg text-neutral-700 transition hover:bg-white lg:hidden"
+              className="grid h-10 w-10 place-items-center rounded-lg text-neutral-700 transition hover:bg-neutral-100 lg:hidden"
               onClick={() => setSidebarOpen(true)}
               aria-label="Открыть боковую панель"
               title="Меню"
             >
               <Menu size={21} />
             </button>
-            <div className="min-w-0 flex-1">
-              <h1 className="truncate text-base font-semibold">{activeSession?.title || "MathMod DataAgent"}</h1>
-              <p className="truncate text-xs text-neutral-500">
-                {isStreaming ? "Ответ формируется" : "История хранится в браузере"}
-              </p>
+            <div className="mx-auto flex w-full max-w-4xl items-center">
+              <div className="min-w-0 flex-1">
+                <h1 className="truncate text-base font-medium text-neutral-900">
+                  {activeSession?.title || "MathMod DataAgent"}
+                </h1>
+              </div>
+              <div className="text-sm text-neutral-500">
+                {isClarifying ? "Уточняю запрос" : streamingSessionId ? "Ответ формируется" : "Готов к запросу"}
+              </div>
             </div>
           </header>
 
-          <section className="flex-1 overflow-y-auto px-4 py-6">
-            <div className="mx-auto flex w-full max-w-4xl flex-col gap-5">
-              {!activeSession?.messages.length && (
-                <div className="flex min-h-[54vh] flex-col items-center justify-center text-center">
-                  <div className="mb-5 grid h-14 w-14 place-items-center rounded-2xl bg-emerald-100 text-emerald-800">
-                    <MessageSquarePlus size={26} />
+          <section className="flex-1 overflow-y-auto px-4 pb-32 pt-8">
+            <div className="mx-auto w-full max-w-4xl">
+              <div className="flex min-w-0 flex-col gap-7">
+                {!activeSession?.messages.length && (
+                  <div className="flex min-h-[58vh] flex-col items-center justify-center text-center">
+                    <div className="mb-5 grid h-14 w-14 place-items-center rounded-2xl bg-neutral-950 text-white">
+                      <MessageSquarePlus size={26} />
+                    </div>
+                    <h2 className="text-2xl font-semibold tracking-normal text-neutral-950">MathMod DataAgent</h2>
+                    <button
+                      type="button"
+                      className="mt-6 max-w-xl rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-left text-sm leading-6 text-neutral-700 transition hover:bg-neutral-100 hover:text-neutral-950"
+                      onClick={sendStarterPrompt}
+                      disabled={isStreaming}
+                    >
+                      {firstPrompt}
+                    </button>
                   </div>
-                  <h2 className="text-2xl font-semibold tracking-normal">MathMod DataAgent</h2>
-                  <button
-                    type="button"
-                    className="mt-6 max-w-xl rounded-lg border border-neutral-200 bg-white px-4 py-3 text-left text-sm text-neutral-700 shadow-sm transition hover:border-emerald-300 hover:text-neutral-950"
-                    onClick={sendStarterPrompt}
-                    disabled={isStreaming}
-                  >
-                    {firstPrompt}
-                  </button>
-                </div>
-              )}
+                )}
 
-              {activeSession?.messages.map((message) => (
-                <article
-                  key={message.id}
-                  className={cx("flex w-full", message.role === "user" ? "justify-end" : "justify-start")}
-                >
-                  <div
-                    className={cx(
-                      "max-w-[min(760px,100%)] whitespace-pre-wrap break-words rounded-lg px-4 py-3 text-[15px] leading-7 shadow-sm",
-                      message.role === "user"
-                        ? "bg-neutral-950 text-white"
-                        : "border border-neutral-200 bg-white text-neutral-900",
-                      message.content.length === 0 && "min-h-14 min-w-28",
-                    )}
+                {activeSession?.messages.map((message) => (
+                  <article
+                    key={message.id}
+                    className={cx("flex w-full", message.role === "user" ? "justify-end" : "justify-start")}
                   >
-                    {message.content || (
-                      <span className="inline-flex items-center gap-1 text-neutral-400">
-                        <span className="h-2 w-2 animate-pulse rounded-full bg-current" />
-                        <span className="h-2 w-2 animate-pulse rounded-full bg-current [animation-delay:120ms]" />
-                        <span className="h-2 w-2 animate-pulse rounded-full bg-current [animation-delay:240ms]" />
-                      </span>
-                    )}
+                    <div
+                      className={cx(
+                        "max-w-[min(760px,100%)] whitespace-pre-wrap break-words text-[16px] leading-8",
+                        message.role === "user"
+                          ? "rounded-[24px] bg-[#f4f4f4] px-5 py-3 text-neutral-950"
+                          : "px-0 py-1 text-neutral-900",
+                        message.content.length === 0 && !message.clarification && "min-h-12 min-w-24",
+                      )}
+                    >
+                      {message.clarification && (
+                        <div className="mb-4 max-w-[640px] whitespace-normal rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm leading-6 text-neutral-800">
+                          <div className="font-medium text-neutral-950">
+                            {message.clarification.question || "Нужно уточнение"}
+                          </div>
+                          {message.clarification.reason && (
+                            <div className="mt-2 text-neutral-700">{message.clarification.reason}</div>
+                          )}
+                          {message.clarificationStatus === "pending" && (
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              {message.clarification.options.map((option) => (
+                                <button
+                                  key={`${message.id}-${option.value}`}
+                                  type="button"
+                                  className="inline-flex min-h-9 items-center rounded-lg border border-neutral-200 bg-white px-3 py-1.5 text-sm text-neutral-800 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-50"
+                                  onClick={() => chooseClarificationOption(option)}
+                                  disabled={isStreaming}
+                                >
+                                  {option.label}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                          {message.clarificationStatus === "answered" && (
+                            <div className="mt-3 text-xs font-medium text-neutral-500">Уточнение применено</div>
+                          )}
+                        </div>
+                      )}
+                      {message.content || (!message.clarification && (
+                        <span className="inline-flex items-center gap-1 text-neutral-500">
+                          <span className="h-2 w-2 animate-pulse rounded-full bg-current" />
+                          <span className="h-2 w-2 animate-pulse rounded-full bg-current [animation-delay:120ms]" />
+                          <span className="h-2 w-2 animate-pulse rounded-full bg-current [animation-delay:240ms]" />
+                        </span>
+                      ))}
+                    </div>
+                  </article>
+                ))}
+
+                {canShowCopy && (
+                  <div className="flex flex-wrap items-center gap-1 pl-1">
+                    <button
+                      type="button"
+                      className="grid h-9 w-9 place-items-center rounded-lg text-neutral-500 transition hover:bg-neutral-100 hover:text-neutral-950"
+                      onClick={copyLatestAnswer}
+                      aria-label="Скопировать ответ"
+                      title="Скопировать"
+                    >
+                      <Copy size={17} />
+                    </button>
                   </div>
-                </article>
-              ))}
+                )}
 
-              {canShowFeedback && (
-                <div className="flex flex-wrap items-center gap-2 pl-1">
-                  <button
-                    type="button"
-                    className="inline-flex h-9 items-center gap-2 rounded-lg border border-neutral-200 bg-white px-3 text-sm font-medium text-neutral-700 transition hover:border-emerald-300 hover:text-emerald-800"
-                    onClick={acceptAnswer}
-                  >
-                    <Check size={16} />
-                    Принять
-                  </button>
-                  <button
-                    type="button"
-                    className="inline-flex h-9 items-center gap-2 rounded-lg border border-neutral-200 bg-white px-3 text-sm font-medium text-neutral-700 transition hover:border-amber-300 hover:text-amber-800"
-                    onClick={beginClarification}
-                  >
-                    <PenLine size={16} />
-                    Уточнить
-                  </button>
-                </div>
-              )}
+                <div ref={messagesEndRef} />
+              </div>
 
-              <div ref={messagesEndRef} />
             </div>
           </section>
 
-          <footer className="sticky bottom-0 border-t border-neutral-200 bg-[#f6f7f9]/95 px-4 py-4 backdrop-blur">
+          <aside className="fixed right-10 top-24 z-20 hidden max-h-[70vh] w-14 2xl:block">
+            {(activeSession?.checkpoints ?? []).length === 0 && (
+              <div className="flex h-28 flex-col items-center justify-center gap-4">
+                {[0, 1, 2, 3].map((item) => (
+                  <span key={item} className="h-2 w-2 rounded-full bg-neutral-200" aria-hidden="true" />
+                ))}
+              </div>
+            )}
+
+            <div className="max-h-[70vh] overflow-visible py-1">
+              {(activeSession?.checkpoints ?? []).map((checkpoint, index, checkpoints) => {
+                const isLast = index === checkpoints.length - 1;
+                return (
+                  <div key={checkpoint.id} className="group relative flex flex-col items-center">
+                    <button
+                      type="button"
+                      className={cx(
+                        "grid h-10 w-10 place-items-center rounded-full border bg-white text-[11px] font-medium tabular-nums shadow-sm transition hover:border-neutral-950 hover:text-neutral-950 disabled:cursor-not-allowed disabled:opacity-50",
+                        isLast ? "border-sky-400 text-sky-700" : "border-neutral-200 text-neutral-500",
+                      )}
+                      onClick={() => rollbackToCheckpoint(checkpoint.id)}
+                      disabled={isStreaming}
+                      title={formatCheckpointTitle(checkpoint, index)}
+                      aria-label={`Откатиться к чекпоинту ${index + 1}`}
+                    >
+                      {index + 1}
+                    </button>
+
+                    <div className="pointer-events-none absolute right-12 top-0 hidden w-72 rounded-xl border border-neutral-200 bg-white px-4 py-3 text-sm leading-5 text-neutral-800 shadow-[0_18px_50px_rgba(0,0,0,0.14)] group-hover:block">
+                      <div className="font-medium text-neutral-950">{formatCheckpointTitle(checkpoint, index)}</div>
+                      {checkpoint.pendingClarification?.clarification.question && (
+                        <div className="mt-1 text-xs text-neutral-500">
+                          {checkpoint.pendingClarification.clarification.question}
+                        </div>
+                      )}
+                      {checkpoint.pendingClarification?.clarification.reason && (
+                        <div className="mt-2 text-neutral-700">
+                          {checkpoint.pendingClarification.clarification.reason}
+                        </div>
+                      )}
+                    </div>
+
+                    {!isLast && <div className="h-8 w-px bg-neutral-200" aria-hidden="true" />}
+                  </div>
+                );
+              })}
+            </div>
+          </aside>
+
+          <footer className="fixed bottom-0 left-0 right-0 bg-gradient-to-t from-white via-white to-white/0 px-4 pb-4 pt-10 lg:left-[260px]">
             <div className="mx-auto w-full max-w-4xl">
               {error && (
-                <div className="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                <div className="mb-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
                   {error}
                 </div>
               )}
               {mode === "clarify" && (
-                <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                <div className="mb-3 flex items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
                   <span>Уточнение заменит последний запрос и ответ.</span>
                   <button
                     type="button"
@@ -532,22 +773,22 @@ function App() {
                 </div>
               )}
               <form
-                className="flex items-end gap-3 rounded-xl border border-neutral-300 bg-white p-2 shadow-sm focus-within:border-emerald-400"
+                className="flex items-end gap-2 rounded-[28px] border border-neutral-200 bg-white p-2 shadow-[0_18px_60px_rgba(0,0,0,0.12)] focus-within:border-neutral-300"
                 onSubmit={sendMessage}
               >
                 <textarea
                   ref={textareaRef}
-                  className="max-h-48 min-h-12 flex-1 resize-none bg-transparent px-3 py-3 text-[15px] leading-6 outline-none placeholder:text-neutral-400"
+                  className="max-h-48 min-h-12 flex-1 resize-none bg-transparent px-4 py-3 text-[16px] leading-6 text-neutral-950 outline-none placeholder:text-neutral-500"
                   value={input}
                   onChange={(event) => setInput(event.target.value)}
                   onKeyDown={handleComposerKeyDown}
-                  placeholder={mode === "clarify" ? "Уточните ответ" : "Спросите про данные, расчеты или источники"}
+                  placeholder={mode === "clarify" ? "Уточните ответ" : "Спросите MathMod DataAgent"}
                   rows={1}
                   disabled={isStreaming}
                 />
                 <button
                   type="submit"
-                  className="grid h-11 w-11 shrink-0 place-items-center rounded-lg bg-emerald-700 text-white transition hover:bg-emerald-800 disabled:cursor-not-allowed disabled:bg-neutral-300"
+                  className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-neutral-950 text-white transition hover:bg-neutral-800 disabled:cursor-not-allowed disabled:bg-neutral-200 disabled:text-neutral-500"
                   disabled={!input.trim() || isStreaming}
                   aria-label="Отправить"
                   title="Отправить"
@@ -555,6 +796,9 @@ function App() {
                   <Send size={19} />
                 </button>
               </form>
+              <p className="mt-3 text-center text-xs text-neutral-500">
+                MathMod может ошибаться. Проверяйте важные данные и расчёты.
+              </p>
             </div>
           </footer>
         </main>

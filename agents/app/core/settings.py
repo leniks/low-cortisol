@@ -10,6 +10,8 @@ class AgentSettings:
     yandex_api_key: str
     yandex_llm_base_url: str
     yandex_chat_model: str
+    yandex_classifier_model: str
+    yandex_clarifier_model: str
     database_url: str | None = None
     vector_database_url: str | None = None
     s3_bucket: str | None = None
@@ -31,8 +33,16 @@ class AgentSettings:
                 "YANDEX_CHAT_MODEL",
                 f"gpt://{folder_id}/qwen3.6-35b-a3b/latest",
             ),
+            yandex_classifier_model=os.getenv(
+                "YANDEX_CLASSIFIER_MODEL",
+                os.getenv("YANDEX_CHAT_MODEL", f"gpt://{folder_id}/qwen3.6-35b-a3b/latest"),
+            ),
+            yandex_clarifier_model=os.getenv(
+                "YANDEX_CLARIFIER_MODEL",
+                os.getenv("YANDEX_CLASSIFIER_MODEL")
+                or os.getenv("YANDEX_CHAT_MODEL", f"gpt://{folder_id}/qwen3.6-35b-a3b/latest"),
+            ),
             database_url=os.getenv("DATABASE_URL"),
             vector_database_url=os.getenv("VECTOR_DATABASE_URL") or os.getenv("DATABASE_URL"),
             s3_bucket=os.getenv("S3_BUCKET"),
         )
-
