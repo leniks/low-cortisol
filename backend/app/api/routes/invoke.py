@@ -48,7 +48,10 @@ async def _stream_chat_answer(
         history=history,
         route_decision=route_decision.model_dump() if route_decision else None,
     ):
-        if event.get("type") != "final":
+        event_type = str(event.get("type", ""))
+        if event_type != "final":
+            if event_type in {"thought", "tool_call", "tool_result", "iteration"}:
+                yield _sse_event("trace", event)
             continue
         chunk = str(event.get("text", ""))
         if not chunk:

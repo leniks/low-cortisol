@@ -20,13 +20,13 @@ async def _stream_main_agent_answer(body: InvokeRequest) -> AsyncGenerator[str, 
     service = get_main_agent_chat_service()
 
     try:
-        async for chunk in service.run_stream(
+        async for event in service.run_stream(
             message=body.message,
             history=body.history,
             conversation_id=body.conversation_id,
             route_decision=body.route_decision,
         ):
-            yield _sse_data({"type": "final", "text": chunk})
+            yield _sse_data(event)
     except Exception as exc:
         yield _sse_data({"type": "final", "text": f"Agent service error: {exc}"})
 

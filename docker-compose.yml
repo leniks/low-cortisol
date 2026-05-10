@@ -26,14 +26,25 @@ services:
     build:
       context: ./agents
     container_name: matmod-rag-agents
+    volumes:
+      - ./agents/dumps:/app/dumps
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-matmod}:${POSTGRES_PASSWORD:-matmod_password}@postgres:5432/${POSTGRES_DB:-matmod_rag}
       YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}
       YANDEX_API_KEY: ${YANDEX_API_KEY:-}
       YANDEX_LLM_BASE_URL: ${YANDEX_LLM_BASE_URL:-https://llm.api.cloud.yandex.net/v1}
+      YANDEX_AI_BASE_URL: ${YANDEX_AI_BASE_URL:-https://llm.api.cloud.yandex.net/foundationModels/v1}
       YANDEX_CHAT_MODEL: ${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}
       YANDEX_CLASSIFIER_MODEL: ${YANDEX_CLASSIFIER_MODEL:-${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}}
       YANDEX_CLARIFIER_MODEL: ${YANDEX_CLARIFIER_MODEL:-${YANDEX_CLASSIFIER_MODEL:-${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}}}
+      YANDEX_QUERY_ENRICHER_MODEL: ${YANDEX_QUERY_ENRICHER_MODEL:-${YANDEX_CLASSIFIER_MODEL:-${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}}}
+      YANDEX_RERANKER_MODEL: ${YANDEX_RERANKER_MODEL:-${YANDEX_CLASSIFIER_MODEL:-${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}}}
+      YANDEX_QUERY_EMBEDDING_MODEL: ${YANDEX_QUERY_EMBEDDING_MODEL:-emb://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/text-search-query/latest}
+      RAG_VECTOR_TABLE: ${RAG_VECTOR_TABLE:-rag_embeddings}
+      RAG_EMBEDDING_COLUMN: ${RAG_EMBEDDING_COLUMN:-embedding}
+      RAG_TOP_K: ${RAG_TOP_K:-30}
+      RAG_RERANK_MAX_KEEP: ${RAG_RERANK_MAX_KEEP:-10}
+      RAG_DESCRIPTION_CHARS: ${RAG_DESCRIPTION_CHARS:-450}
     ports:
       - "${AGENT_SERVICE_PORT:-8001}:8001"
     healthcheck:

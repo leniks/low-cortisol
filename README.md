@@ -106,9 +106,16 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - `YANDEX_FOLDER_ID` — folder id Yandex Cloud для агентского CLI
 - `YANDEX_API_KEY` — API key Yandex Cloud для Agent Service и CLI
 - `YANDEX_LLM_BASE_URL` — OpenAI-compatible endpoint Yandex LLM
+- `YANDEX_AI_BASE_URL` — endpoint Yandex Foundation Models API для embedding-запросов
 - `YANDEX_CHAT_MODEL` — модель для `agents/main.py`
 - `YANDEX_CLASSIFIER_MODEL` — отдельная модель классификатора, который решает, нужен ли RAG
 - `YANDEX_CLARIFIER_MODEL` — отдельная модель уточнений, которая проверяет, хватает ли параметров запроса
+- `YANDEX_QUERY_ENRICHER_MODEL` — модель, которая превращает запрос в plain-text `search_text`
+- `YANDEX_RERANKER_MODEL` — модель, которая отсеивает контекстно неподходящие датасеты после pgvector
+- `YANDEX_QUERY_EMBEDDING_MODEL` — модель эмбеддинга для поиска по описаниям датасетов
+- `RAG_TOP_K` — сколько датасетов брать из pgvector после enrichment, по умолчанию `30`
+- `RAG_RERANK_MAX_KEEP` — максимум датасетов после rerank-фильтра, по умолчанию `10`
+- `RAG_VECTOR_TABLE`, `RAG_EMBEDDING_COLUMN` — таблица и колонка с векторами описаний датасетов; для перенесённого каталога из `matmod` дефолт `rag_embeddings.embedding`
 
 ## API
 

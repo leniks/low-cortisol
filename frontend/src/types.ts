@@ -13,6 +13,17 @@ export type ClarificationResult = {
   reason: string;
 };
 
+export type AgentTraceEventType = "thought" | "tool_call" | "tool_result" | "iteration";
+
+export type AgentTraceEvent = {
+  id: string;
+  type: AgentTraceEventType;
+  title: string;
+  tool?: string;
+  payload?: unknown;
+  createdAt: string;
+};
+
 export type ChatMessage = {
   id: string;
   role: MessageRole;
@@ -20,6 +31,7 @@ export type ChatMessage = {
   createdAt: string;
   clarification?: ClarificationResult;
   clarificationStatus?: "pending" | "answered";
+  agentTrace?: AgentTraceEvent[];
 };
 
 export type PendingClarification = {

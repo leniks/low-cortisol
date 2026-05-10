@@ -1,4 +1,11 @@
-import type { ChatCheckpoint, ChatMessage, ChatSession, PendingClarification, PersistedChatState } from "./types";
+import type {
+  AgentTraceEvent,
+  ChatCheckpoint,
+  ChatMessage,
+  ChatSession,
+  PendingClarification,
+  PersistedChatState,
+} from "./types";
 
 export const STORAGE_KEY = "mathmod.chat.sessions.v1";
 
@@ -62,7 +69,40 @@ function normalizeMessage(value: unknown): ChatMessage {
     }
   }
 
+  if (Array.isArray(message.agentTrace)) {
+    const agentTrace = message.agentTrace
+      .filter(isAgentTraceEvent)
+      .map(normalizeAgentTraceEvent);
+    if (agentTrace.length > 0) {
+      normalized.agentTrace = agentTrace;
+    }
+  }
+
   return normalized;
+}
+
+function isAgentTraceEvent(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const trace = value as Record<string, unknown>;
+  return (
+    typeof trace.id === "string" &&
+    (trace.type === "thought" || trace.type === "tool_call" || trace.type === "tool_result" || trace.type === "iteration") &&
+    typeof trace.title === "string" &&
+    (typeof trace.tool === "string" || trace.tool === undefined) &&
+    typeof trace.createdAt === "string"
+  );
+}
+
+function normalizeAgentTraceEvent(value: unknown): AgentTraceEvent {
+  const trace = value as Record<string, unknown>;
+  return {
+    id: trace.id as string,
+    type: trace.type as AgentTraceEvent["type"],
+    title: trace.title as string,
+    tool: typeof trace.tool === "string" ? trace.tool : undefined,
+    payload: trace.payload,
+    createdAt: trace.createdAt as string,
+  };
 }
 
 function isPendingClarification(value: unknown): boolean {
@@ -117,7 +157,7 @@ function normalizeCheckpoint(value: unknown): ChatCheckpoint | undefined {
     id: checkpoint.id,
     title: checkpoint.title,
     createdAt: checkpoint.createdAt,
-    messages: checkpoint.messages.map(normalizeMessage).filter((message) => message.content.trim() || message.clarification),
+    messages: checkpoint.messages.map(normalizeMessage).filter(shouldKeepMessage),
     pendingClarification: normalizePendingClarification(checkpoint.pendingClarification),
   };
 }
@@ -146,12 +186,16 @@ function normalizeSession(session: ChatSession): ChatSession {
     title: session.title,
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,
-    messages: session.messages.map(normalizeMessage).filter((message) => message.content.trim() || message.clarification),
+    messages: session.messages.map(normalizeMessage).filter(shouldKeepMessage),
     pendingClarification: isPendingClarification(session.pendingClarification)
       ? normalizePendingClarification(session.pendingClarification)
       : undefined,
     checkpoints: checkpoints.length > 0 ? checkpoints : undefined,
   };
+}
+
+function shouldKeepMessage(message: ChatMessage): boolean {
+  return Boolean(message.content.trim() || message.clarification || message.agentTrace?.length);
 }
 
 export function loadChatState(): PersistedChatState {

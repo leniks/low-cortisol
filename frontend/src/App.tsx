@@ -9,9 +9,11 @@ import {
   X,
 } from "lucide-react";
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { clarifyMissing, createChatStreamUrl, syncDialog } from "./chatApi";
 import { loadChatState, saveChatState } from "./storage";
 import type {
+  AgentTraceEvent,
   ChatCheckpoint,
   ChatMessage,
   ChatSession,
@@ -61,7 +63,24 @@ function cloneMessages(messages: ChatMessage[]): ChatMessage[] {
   return messages.map((message) => ({
     ...message,
     clarification: message.clarification ? cloneClarification(message.clarification) : undefined,
+    agentTrace: message.agentTrace?.map(cloneTraceEvent),
   }));
+}
+
+function cloneTraceEvent(event: AgentTraceEvent): AgentTraceEvent {
+  return {
+    ...event,
+    payload: cloneJsonValue(event.payload),
+  };
+}
+
+function cloneJsonValue(value: unknown): unknown {
+  if (value === undefined) return undefined;
+  try {
+    return JSON.parse(JSON.stringify(value)) as unknown;
+  } catch {
+    return String(value);
+  }
 }
 
 function cloneClarification(clarification: NonNullable<ChatMessage["clarification"]>): NonNullable<ChatMessage["clarification"]> {
@@ -80,6 +99,382 @@ function appendClarificationValue(message: string, value: string): string {
   const normalized = message.trim();
   if (!normalized) return value;
   return `${normalized}, ${value}`;
+}
+
+function createTraceEvent(data: Partial<AgentTraceEvent>): AgentTraceEvent {
+  const type = data.type && ["thought", "tool_call", "tool_result", "iteration"].includes(data.type)
+    ? data.type
+    : "thought";
+  return {
+    id: createId(),
+    type,
+    title: data.title || getTraceTypeLabel(type),
+    tool: data.tool,
+    payload: data.payload,
+    createdAt: nowIso(),
+  };
+}
+
+function getTraceTypeLabel(type: AgentTraceEvent["type"]): string {
+  switch (type) {
+    case "tool_call":
+      return "Вызов";
+    case "tool_result":
+      return "Результат";
+    case "iteration":
+      return "Итерация";
+    default:
+      return "Мысль";
+  }
+}
+
+function formatTracePayload(payload: unknown): string {
+  if (payload === undefined || payload === null) return "";
+  try {
+    return JSON.stringify(payload, null, 2);
+  } catch {
+    return String(payload);
+  }
+}
+
+type AnswerBlock =
+  | { type: "paragraph"; text: string }
+  | { type: "list"; items: string[] }
+  | { type: "code"; language: string; code: string }
+  | { type: "table"; headers: string[]; rows: string[][] };
+
+type AnswerSection = {
+  title?: string;
+  blocks: AnswerBlock[];
+};
+
+function parseAssistantAnswer(content: string): AnswerSection[] {
+  const lines = normalizeInlineMarkdownTables(content).split(/\r?\n/);
+  const sections: AnswerSection[] = [{ blocks: [] }];
+  let paragraph: string[] = [];
+  let listItems: string[] = [];
+  let tableRows: string[][] = [];
+  let codeLines: string[] = [];
+  let codeLanguage = "";
+  let inCode = false;
+
+  function currentSection(): AnswerSection {
+    return sections[sections.length - 1];
+  }
+
+  function flushParagraph(): void {
+    if (paragraph.length === 0) return;
+    currentSection().blocks.push({ type: "paragraph", text: paragraph.join(" ").trim() });
+    paragraph = [];
+  }
+
+  function flushList(): void {
+    if (listItems.length === 0) return;
+    currentSection().blocks.push({ type: "list", items: listItems });
+    listItems = [];
+  }
+
+  function flushTable(): void {
+    if (tableRows.length === 0) return;
+    const separatorIndex = tableRows.findIndex(isTableSeparatorRow);
+    const headerIndex = separatorIndex > 0 ? separatorIndex - 1 : 0;
+    const headers = tableRows[headerIndex] ?? [];
+    const rows =
+      separatorIndex >= 0
+        ? tableRows.filter((_, index) => index !== separatorIndex && index !== headerIndex)
+        : tableRows.slice(1);
+    const normalized = normalizeTable(headers, rows);
+
+    if (normalized.headers.length > 0) {
+      currentSection().blocks.push({ type: "table", ...normalized });
+    } else {
+      currentSection().blocks.push({ type: "paragraph", text: tableRows.map(joinTableRow).join(" ") });
+    }
+
+    tableRows = [];
+  }
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    const fence = line.match(/^```(\w+)?\s*$/);
+
+    if (fence) {
+      if (inCode) {
+        currentSection().blocks.push({ type: "code", language: codeLanguage, code: codeLines.join("\n") });
+        codeLines = [];
+        codeLanguage = "";
+        inCode = false;
+      } else {
+        flushParagraph();
+        flushList();
+        flushTable();
+        inCode = true;
+        codeLanguage = fence[1] || "";
+      }
+      continue;
+    }
+
+    if (inCode) {
+      codeLines.push(rawLine);
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushParagraph();
+      flushList();
+      flushTable();
+      continue;
+    }
+
+    if (isMarkdownTableLine(line)) {
+      flushParagraph();
+      flushList();
+      tableRows.push(splitTableRow(line));
+      continue;
+    }
+
+    flushTable();
+
+    const heading = line.match(/^#{1,4}\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      sections.push({ title: heading[1].trim(), blocks: [] });
+      continue;
+    }
+
+    const listItem = line.match(/^[-*]\s+(.+)$/);
+    if (listItem) {
+      flushParagraph();
+      listItems.push(listItem[1].trim());
+      continue;
+    }
+
+    flushList();
+    paragraph.push(line.trim());
+  }
+
+  if (inCode) {
+    currentSection().blocks.push({ type: "code", language: codeLanguage, code: codeLines.join("\n") });
+  }
+  flushParagraph();
+  flushList();
+  flushTable();
+
+  return sections.filter((section) => section.title || section.blocks.length > 0);
+}
+
+function normalizeInlineMarkdownTables(content: string): string {
+  let inCode = false;
+  return content
+    .split(/\r?\n/)
+    .map((line) => {
+      if (/^```/.test(line.trim())) {
+        inCode = !inCode;
+        return line;
+      }
+
+      if (inCode || !looksLikeInlineTable(line)) return line;
+      return line.replace(/\|\s+\|/g, "|\n|");
+    })
+    .join("\n");
+}
+
+function looksLikeInlineTable(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("|")) return false;
+  return /\|\s*:?-{3,}:?\s*\|/.test(trimmed) && /\|\s+\|/.test(trimmed);
+}
+
+function isMarkdownTableLine(line: string): boolean {
+  const trimmed = line.trim();
+  return trimmed.startsWith("|") && splitTableRow(trimmed).length >= 2;
+}
+
+function splitTableRow(line: string): string[] {
+  const trimmed = line.trim();
+  const withoutStart = trimmed.startsWith("|") ? trimmed.slice(1) : trimmed;
+  const withoutEnd = withoutStart.endsWith("|") ? withoutStart.slice(0, -1) : withoutStart;
+  return withoutEnd.split("|").map((cell) => cell.trim());
+}
+
+function isTableSeparatorRow(row: string[]): boolean {
+  return row.length > 0 && row.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s+/g, "")));
+}
+
+function normalizeTable(headers: string[], rows: string[][]): { headers: string[]; rows: string[][] } {
+  const columnCount = Math.max(headers.length, ...rows.map((row) => row.length));
+  if (columnCount === 0) return { headers: [], rows: [] };
+
+  return {
+    headers: normalizeTableRow(headers, columnCount),
+    rows: rows.map((row) => normalizeTableRow(row, columnCount)),
+  };
+}
+
+function normalizeTableRow(row: string[], columnCount: number): string[] {
+  return Array.from({ length: columnCount }, (_, index) => row[index] ?? "");
+}
+
+function joinTableRow(row: string[]): string {
+  return `| ${row.join(" | ")} |`;
+}
+
+function renderInline(text: string): ReactNode[] {
+  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).filter(Boolean);
+  return parts.map((part, index) => {
+    if (part.startsWith("`") && part.endsWith("`")) {
+      return (
+        <code
+          key={`${part}-${index}`}
+          className="rounded-md border border-neutral-200 bg-neutral-50 px-1.5 py-0.5 text-[0.92em] font-medium text-neutral-900"
+        >
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return (
+        <strong key={`${part}-${index}`} className="font-semibold text-neutral-950">
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+
+    return part;
+  });
+}
+
+function AssistantAnswer({ content }: { content: string }): ReactNode {
+  const sections = parseAssistantAnswer(content);
+  if (sections.length === 0) return null;
+
+  return (
+    <div className="space-y-4 whitespace-normal text-[15px] leading-7 text-neutral-900">
+      {sections.map((section, index) => (
+        <AnswerSectionView key={`${section.title || "intro"}-${index}`} section={section} />
+      ))}
+    </div>
+  );
+}
+
+function AnswerSectionView({ section }: { section: AnswerSection }): ReactNode {
+  const titleParts = section.title?.match(/^(\d+)\.\s*(.+)$/);
+  const titleNumber = titleParts?.[1];
+  const title = titleParts?.[2] || section.title;
+  const datasetMode = Boolean(title?.toLowerCase().includes("набор"));
+
+  return (
+    <section className={cx(section.title && "rounded-xl border border-neutral-200 bg-white px-4 py-3 shadow-sm")}>
+      {title && (
+        <div className="mb-3 flex items-center gap-3">
+          {titleNumber && (
+            <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-neutral-950 text-xs font-semibold text-white">
+              {titleNumber}
+            </span>
+          )}
+          <h3 className="text-sm font-semibold uppercase tracking-wide text-neutral-950">{title}</h3>
+        </div>
+      )}
+      <div className="space-y-3">
+        {section.blocks.map((block, index) => (
+          <AnswerBlockView
+            key={`${block.type}-${index}`}
+            block={block}
+            datasetMode={datasetMode}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function AnswerBlockView({ block, datasetMode }: { block: AnswerBlock; datasetMode: boolean }): ReactNode {
+  if (block.type === "code") {
+    const language = block.language || "text";
+    return (
+      <div className="overflow-hidden rounded-lg border border-neutral-800 bg-neutral-950">
+        <div className="flex h-9 items-center justify-between border-b border-white/10 px-3 text-xs text-neutral-300">
+          <span className="font-medium uppercase tracking-wide">{language}</span>
+          {language.toLowerCase() === "sql" && <span>Analyst SQL</span>}
+        </div>
+        <pre className="max-h-[420px] overflow-auto p-4 text-[13px] leading-6 text-neutral-100">
+          <code>{block.code}</code>
+        </pre>
+      </div>
+    );
+  }
+
+  if (block.type === "list") {
+    if (datasetMode) {
+      return (
+        <div className="flex flex-wrap gap-2">
+          {block.items.map((item, index) => (
+            <span
+              key={`${item}-${index}`}
+              className="inline-flex min-h-8 items-center rounded-full border border-neutral-200 bg-neutral-50 px-3 text-sm font-medium text-neutral-900"
+            >
+              {renderInline(item)}
+            </span>
+          ))}
+        </div>
+      );
+    }
+
+    return (
+      <ul className="space-y-2">
+        {block.items.map((item, index) => (
+          <li key={`${item}-${index}`} className="flex gap-2 text-neutral-800">
+            <span className="mt-3 h-1.5 w-1.5 shrink-0 rounded-full bg-neutral-400" />
+            <span>{renderInline(item)}</span>
+          </li>
+        ))}
+      </ul>
+    );
+  }
+
+  if (block.type === "table") {
+    return (
+      <div className="overflow-hidden rounded-lg border border-neutral-200 bg-white">
+        <div className="overflow-x-auto">
+          <table className="min-w-full border-collapse text-sm">
+            <thead className="bg-neutral-50">
+              <tr>
+                {block.headers.map((header, index) => (
+                  <th
+                    key={`${header}-${index}`}
+                    className="border-b border-neutral-200 px-4 py-2.5 text-left font-semibold text-neutral-950"
+                  >
+                    {renderInline(header)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {block.rows.map((row, rowIndex) => (
+                <tr key={`row-${rowIndex}`} className="border-b border-neutral-100 last:border-b-0">
+                  {row.map((cell, cellIndex) => (
+                    <td
+                      key={`${cell}-${rowIndex}-${cellIndex}`}
+                      className={cx(
+                        "px-4 py-2.5 text-neutral-800",
+                        cellIndex === 0 && "font-medium text-neutral-950",
+                      )}
+                    >
+                      {renderInline(cell)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  }
+
+  return <p className="text-neutral-800">{renderInline(block.text)}</p>;
 }
 
 function App() {
@@ -189,6 +584,23 @@ function App() {
           updatedAt: nowIso(),
           messages: session.messages.map((message) =>
             message.id === assistantMessageId ? { ...message, content: message.content + chunk } : message,
+          ),
+        };
+      }),
+    );
+  }
+
+  function appendAssistantTrace(sessionId: string, assistantMessageId: string, trace: AgentTraceEvent): void {
+    updateSessions((sessions) =>
+      sessions.map((session) => {
+        if (session.id !== sessionId) return session;
+        return {
+          ...session,
+          updatedAt: nowIso(),
+          messages: session.messages.map((message) =>
+            message.id === assistantMessageId
+              ? { ...message, agentTrace: [...(message.agentTrace ?? []), trace] }
+              : message,
           ),
         };
       }),
@@ -306,6 +718,15 @@ function App() {
         }
       } catch {
         // Ignore malformed stream chunks.
+      }
+    });
+
+    source.addEventListener("trace", (event) => {
+      try {
+        const data = JSON.parse(event.data || "{}") as Partial<AgentTraceEvent>;
+        appendAssistantTrace(session.id, assistantMessageId, createTraceEvent(data));
+      } catch {
+        // Ignore malformed trace events.
       }
     });
 
@@ -671,13 +1092,73 @@ function App() {
                           )}
                         </div>
                       )}
-                      {message.content || (!message.clarification && (
-                        <span className="inline-flex items-center gap-1 text-neutral-500">
-                          <span className="h-2 w-2 animate-pulse rounded-full bg-current" />
-                          <span className="h-2 w-2 animate-pulse rounded-full bg-current [animation-delay:120ms]" />
-                          <span className="h-2 w-2 animate-pulse rounded-full bg-current [animation-delay:240ms]" />
-                        </span>
-                      ))}
+                      {message.role === "assistant" && message.agentTrace && message.agentTrace.length > 0 && (
+                        <details
+                          className="group mb-4 max-w-[720px] whitespace-normal rounded-xl border border-neutral-200 bg-white px-4 py-3 text-sm leading-6 text-neutral-800 shadow-sm"
+                          open
+                        >
+                          <summary className="mb-3 flex cursor-pointer list-none items-center justify-between gap-3">
+                            <span className="font-medium text-neutral-950">Ход выполнения</span>
+                            <span className="flex items-center gap-2">
+                              <span className="rounded-full bg-neutral-100 px-2 py-0.5 text-xs text-neutral-500">
+                                {message.agentTrace.length} шагов
+                              </span>
+                              <span className="text-xs text-neutral-400 group-open:hidden">показать</span>
+                              <span className="text-xs text-neutral-400 group-open:inline hidden">свернуть</span>
+                            </span>
+                          </summary>
+                          <div className="space-y-2">
+                            {message.agentTrace.map((trace, index) => {
+                              const payload = formatTracePayload(trace.payload);
+                              return (
+                                <details
+                                  key={trace.id}
+                                  className="group rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2"
+                                >
+                                  <summary className="flex cursor-pointer list-none items-start gap-3">
+                                    <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-white text-xs font-semibold text-neutral-700 ring-1 ring-neutral-200">
+                                      {index + 1}
+                                    </span>
+                                    <span className="min-w-0 flex-1">
+                                      <span className="flex min-w-0 flex-wrap items-center gap-2">
+                                        <span className="shrink-0 text-xs font-medium uppercase tracking-wide text-neutral-500">
+                                          {getTraceTypeLabel(trace.type)}
+                                        </span>
+                                        <span className="min-w-0 truncate text-sm font-medium text-neutral-950">
+                                          {trace.title}
+                                        </span>
+                                        {trace.tool && (
+                                          <code className="max-w-[240px] truncate rounded bg-white px-1.5 py-0.5 text-xs text-neutral-600 ring-1 ring-neutral-200">
+                                            {trace.tool}
+                                          </code>
+                                        )}
+                                      </span>
+                                    </span>
+                                  </summary>
+                                  {payload && (
+                                    <pre className="mt-3 max-h-80 overflow-auto rounded-lg border border-neutral-200 bg-white p-3 text-xs leading-5 text-neutral-800">
+                                      {payload}
+                                    </pre>
+                                  )}
+                                </details>
+                              );
+                            })}
+                          </div>
+                        </details>
+                      )}
+                      {message.content ? (
+                        message.role === "assistant" ? (
+                          <AssistantAnswer content={message.content} />
+                        ) : (
+                          message.content
+                        )
+                      ) : (!message.clarification && (
+                          <span className="inline-flex items-center gap-1 text-neutral-500">
+                            <span className="h-2 w-2 animate-pulse rounded-full bg-current" />
+                            <span className="h-2 w-2 animate-pulse rounded-full bg-current [animation-delay:120ms]" />
+                            <span className="h-2 w-2 animate-pulse rounded-full bg-current [animation-delay:240ms]" />
+                          </span>
+                        ))}
                     </div>
                   </article>
                 ))}
