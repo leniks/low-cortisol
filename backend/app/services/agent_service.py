@@ -12,7 +12,7 @@ class AgentService:
         self._settings = settings
         self._client = httpx.AsyncClient(
             base_url=self._settings.agent_service_url,
-            timeout=httpx.Timeout(120.0, connect=10.0),
+            timeout=httpx.Timeout(None, connect=10.0),
         )
 
     async def run_stream(

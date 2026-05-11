@@ -18,14 +18,14 @@ async def _stream_main_agent_answer(body: InvokeRequest) -> AsyncGenerator[str, 
     service = get_main_agent_chat_service()
 
     try:
-        async for chunk in service.run_stream(
+        async for event in service.run_stream(
             message=body.message,
             history=body.history,
             conversation_id=body.conversation_id,
         ):
-            yield _sse_data({"type": "final", "text": chunk})
+            yield _sse_data(event)
     except Exception as exc:
-        yield _sse_data({"type": "final", "text": f"Agent service error: {exc}"})
+        yield _sse_data({"type": "final", "text": f"Ошибка сервиса агентов: {exc}"})
 
 
 @router.post("/stream")
@@ -40,4 +40,3 @@ async def invoke_stream_get(
 ) -> StreamingResponse:
     body = InvokeRequest(message=message, conversation_id=conversation_id)
     return StreamingResponse(_stream_main_agent_answer(body), media_type="text/event-stream")
-

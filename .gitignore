@@ -15,3 +15,7 @@ frontend/*.tsbuildinfo
 infra/postgres/data/
 infra/postgres/backups/*
 !infra/postgres/backups/.gitkeep
+infra/chat-postgres/data/
+infra/chat-postgres/backups/*
+!infra/chat-postgres/backups/.gitkeep
+agents/dumps/
