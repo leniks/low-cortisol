@@ -93,8 +93,8 @@ def create_main_agent(
             returned by request_evidence, calculation outputs, and user
             clarifications.
             The user message is a strict JSON payload with type "main_agent_structured_input".
-            Raw prior chat text is intentionally not provided. Use only current_user_message,
-            recent_history_signals, request_facts, and tool outputs.
+            Full raw prior chat text is intentionally not provided. Use only current_user_message,
+            request_facts, truncated recent_dialog_context, recent_history_signals, and tool outputs.
             
             Rules:
             - Before answering, requesting evidence, calculating, or asking a clarification, call
@@ -109,6 +109,12 @@ def create_main_agent(
             - Do not introduce metrics, geography, period, formula, filters, or source claims
               that are absent from current_user_message, request_facts/recent_history_signals,
               your plan, evidence packs, calculation outputs, or user clarifications.
+            - Use recent_dialog_context to resolve short follow-up requests. If the current message
+              omits metric, geography, period, dataset, source, or comparison target, carry them over
+              from the recent dialog unless the current message explicitly changes them.
+            - Treat recent_dialog_context as conversational context only. It may identify what the
+              user is referring to, but final numeric claims must still come from evidence packs,
+              calculation outputs, or user clarifications.
             - If the request asks for data, indicators, comparison, dynamics, a table, SQL-backed
               facts, or calculations, call request_evidence before making analytical claims.
             - Use request_evidence to find datasets, inspect schemas, run SQL checks, and determine

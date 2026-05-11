@@ -184,3 +184,4 @@ def _first_value(signals: list[dict[str, Any]], key: str) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
+

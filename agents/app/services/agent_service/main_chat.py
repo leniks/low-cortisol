@@ -17,6 +17,8 @@ from app.utils.structured_history import build_recent_history_signals, build_req
 
 DEFAULT_MAIN_AGENT_MAX_ATTEMPTS = 3
 MAX_MAIN_AGENT_MAX_ATTEMPTS = 6
+RECENT_DIALOG_CONTEXT_LIMIT = 6
+RECENT_DIALOG_CONTEXT_CHARS = 4000
 
 
 class MainAgentChatService:
@@ -287,7 +289,9 @@ class MainAgentChatService:
             "type": "main_agent_structured_input",
             "current_user_message": message,
             "raw_chat_history_forwarded": False,
+            "recent_dialog_context_forwarded": True,
             "request_facts": build_request_facts(message, history_payload),
+            "recent_dialog_context": MainAgentChatService._recent_dialog_context(history_payload),
             "recent_history_signals": build_recent_history_signals(history_payload, limit=8),
             "planning_contract": {
                 "first_tool": "submit_data_acquisition_plan",
@@ -333,6 +337,24 @@ class MainAgentChatService:
                 ],
             },
         }
+
+
+    @staticmethod
+    def _recent_dialog_context(history_payload: list[dict[str, object]]) -> list[dict[str, object]]:
+        context: list[dict[str, object]] = []
+        for item in history_payload[-RECENT_DIALOG_CONTEXT_LIMIT:]:
+            role = str(item.get("role") or "")
+            content = str(item.get("content") or "").strip()
+            if role not in {"user", "assistant"} or not content:
+                continue
+            context.append(
+                {
+                    "role": role,
+                    "content": content[:RECENT_DIALOG_CONTEXT_CHARS],
+                    "truncated": len(content) > RECENT_DIALOG_CONTEXT_CHARS,
+                }
+            )
+        return context
 
     @staticmethod
     def _main_agent_input_for_attempt(
