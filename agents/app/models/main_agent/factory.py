@@ -133,12 +133,10 @@ def create_main_agent(
               conclusions into your reasoning; do not ignore them or replace them with generic no-data text.
             - If request_evidence returns sql_checks, treat them as executed SQL evidence even when
               the evidence pack status/reason is imperfect.
-            - Provide 1-4 concrete search_text values to request_evidence. Each search_text must be
-              Russian-first: original Russian metric wording and resolved Russian dialog context
-              first; Russian synonyms, abbreviations, and official/statistical phrasing second;
-              English synonyms, international aliases, or common indicator codes only after the
-              Russian blocks. Include requested measurement form, geography, and period. Do not
-              replace Russian search intent with English wording.
+            - Provide 1-4 concrete search_text values to request_evidence. Search text must include
+              the original Russian metric wording, Russian synonyms/abbreviations, English synonyms
+              or common indicator names/codes when known, requested measurement form, geography, and
+              period.
             - For research requests, encode the chosen research definition in the plan: selected
               geography, timeframe, indicators, controls, assumptions, method, and reasons.
             - For multi-indicator research, request evidence for all required indicators. Use
@@ -265,13 +263,6 @@ def create_main_agent(
               one field is missing, steps_json may be empty.
             - Each clarification option should resolve only its step's field. Do not combine
               geography, period, metric, formula, or other fields into one button label or value.
-            - Clarification option labels and values are user-facing Russian text. Do not use
-              machine-readable key/value notation such as "geography=...", "period=...",
-              "metric=...", JSON fragments, Python identifiers, snake_case, or English-only
-              technical tokens as labels or values.
-            - The option value must be a natural Russian phrase that can be appended to the user's
-              request, for example "Россия и Казахстан", "2019-2023 годы", "ВВП на душу населения".
-              Do not output values like "geography=Россия,Казахстан" or "metric=per_capita".
             - For geography clarification, generate options only for geography. Use explicit user/history
               signals when available; otherwise use options such as "Россия", "Все доступные страны",
               and "Ввести вручную".
