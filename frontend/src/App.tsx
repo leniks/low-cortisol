@@ -10,20 +10,26 @@ import {
 } from "lucide-react";
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { clarifyMissing, createChatStreamUrl, syncDialog } from "./chatApi";
-import { loadChatState, saveChatState } from "./storage";
+import { chatClientHeaders, createChatStreamUrl, syncDialog } from "./chatApi";
+import { emptyState, loadChatState, saveChatState } from "./storage";
 import type {
   AgentTraceEvent,
+  AgentTracePhase,
+  AgentTraceStatus,
+  AgentTraceVisibility,
   ChatCheckpoint,
   ChatMessage,
   ChatSession,
   ClarificationOption,
+  ClarificationTurn,
+  ClarificationResult,
   PendingClarification,
   PersistedChatState,
   SendMode,
 } from "./types";
 
 const firstPrompt = "Найди и подготовь набор данных по динамике ВВП России и Казахстана за 2020-2025 годы.";
+const executionStreamUiRevision = "execution-stream-compact-v2";
 
 function createId(): string {
   return crypto.randomUUID();
@@ -63,6 +69,8 @@ function cloneMessages(messages: ChatMessage[]): ChatMessage[] {
   return messages.map((message) => ({
     ...message,
     clarification: message.clarification ? cloneClarification(message.clarification) : undefined,
+    clarificationTraceEnd: message.clarificationTraceEnd,
+    clarificationHistory: message.clarificationHistory?.map(cloneClarificationTurn),
     agentTrace: message.agentTrace?.map(cloneTraceEvent),
   }));
 }
@@ -88,6 +96,19 @@ function cloneClarification(clarification: NonNullable<ChatMessage["clarificatio
     ...clarification,
     missing_fields: [...clarification.missing_fields],
     options: clarification.options.map((option) => ({ ...option })),
+    steps: clarification.steps?.map((step) => ({
+      ...step,
+      options: step.options.map((option) => ({ ...option })),
+    })),
+  };
+}
+
+function cloneClarificationTurn(turn: ClarificationTurn): ClarificationTurn {
+  return {
+    ...turn,
+    clarification: cloneClarification(turn.clarification),
+    selectedOption: { ...turn.selectedOption },
+    traceEnd: turn.traceEnd,
   };
 }
 
@@ -98,7 +119,142 @@ function formatCheckpointTitle(checkpoint: ChatCheckpoint, index: number): strin
 function appendClarificationValue(message: string, value: string): string {
   const normalized = message.trim();
   if (!normalized) return value;
+  if (normalized.toLowerCase().includes(value.trim().toLowerCase())) return normalized;
   return `${normalized}, ${value}`;
+}
+
+function normalizeClarificationToken(value: string): string {
+  return value.trim().toLowerCase().replaceAll("ё", "е").replace(/\s+/g, " ");
+}
+
+function isManualClarificationOption(option: ClarificationOption): boolean {
+  const value = normalizeClarificationToken(option.value);
+  const label = normalizeClarificationToken(option.label);
+  return (
+    value === "manual" ||
+    value === "__manual__" ||
+    value === "ввести вручную" ||
+    value === "введите вручную" ||
+    label === "ввести вручную" ||
+    label === "введите вручную" ||
+    label.includes("вручную")
+  );
+}
+
+function normalizeClarificationOptions(options: unknown[]): ClarificationOption[] {
+  return options
+    .filter(
+      (option): option is ClarificationOption =>
+        Boolean(option) &&
+        typeof option === "object" &&
+        typeof (option as ClarificationOption).label === "string" &&
+        typeof (option as ClarificationOption).value === "string",
+    )
+    .map((option) => (isManualClarificationOption(option) ? { ...option, value: "manual" } : option));
+}
+
+type ClarificationField = ClarificationResult["missing_fields"][number];
+type ClarificationStep = NonNullable<ClarificationResult["steps"]>[number];
+
+function isClarificationField(value: unknown): value is ClarificationField {
+  return value === "period" || value === "geography" || value === "metric" || value === "formula" || value === "other";
+}
+
+function normalizeClarificationSteps(value: unknown): ClarificationStep[] {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map((candidate): ClarificationStep | undefined => {
+      if (!candidate || typeof candidate !== "object") return undefined;
+      const step = candidate as Partial<ClarificationStep>;
+      if (!isClarificationField(step.field)) return undefined;
+
+      const options = Array.isArray(step.options) ? normalizeClarificationOptions(step.options) : [];
+      if (options.length === 0) return undefined;
+
+      return {
+        field: step.field,
+        question: typeof step.question === "string" || step.question === null ? step.question : undefined,
+        reason: typeof step.reason === "string" ? step.reason : undefined,
+        options,
+      };
+    })
+    .filter((step): step is ClarificationStep => Boolean(step));
+}
+
+function clarificationSteps(clarification: ClarificationResult): ClarificationStep[] {
+  if (clarification.steps?.length) return clarification.steps;
+
+  return [
+    {
+      field: clarification.missing_fields.find(isClarificationField) ?? "other",
+      question: clarification.question,
+      reason: clarification.reason,
+      options: clarification.options.length > 0
+        ? clarification.options
+        : [{ label: "Ввести вручную", value: "manual" }],
+    },
+  ];
+}
+
+function clarificationForStep(clarification: ClarificationResult, step: ClarificationStep): ClarificationResult {
+  return {
+    ...clarification,
+    question: step.question ?? clarification.question,
+    missing_fields: [step.field],
+    options: step.options,
+    reason: step.reason || clarification.reason,
+  };
+}
+
+function currentPendingClarification(pending: PendingClarification): ClarificationResult {
+  const steps = clarificationSteps(pending.clarification);
+  const stepIndex = Math.min(pending.stepIndex ?? 0, steps.length - 1);
+  return clarificationForStep(pending.clarification, steps[stepIndex]);
+}
+
+function clarificationFieldsKey(clarification: ClarificationResult): string {
+  return clarification.missing_fields.length > 0
+    ? [...clarification.missing_fields].sort().join("|")
+    : clarification.question || "other";
+}
+
+function mergeClarificationHistory(
+  history: ClarificationTurn[] | undefined,
+  turn: ClarificationTurn,
+): ClarificationTurn[] {
+  const key = clarificationFieldsKey(turn.clarification);
+  return [...(history ?? []).filter((item) => clarificationFieldsKey(item.clarification) !== key), turn];
+}
+
+function parseStreamClarification(value: unknown): ClarificationResult | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const event = value as { clarification?: unknown };
+  const candidate = event.clarification && typeof event.clarification === "object"
+    ? event.clarification
+    : value;
+  if (!candidate || typeof candidate !== "object") return undefined;
+
+  const clarification = candidate as Partial<ClarificationResult>;
+  if (
+    typeof clarification.is_complete !== "boolean" ||
+    !Array.isArray(clarification.missing_fields) ||
+    !Array.isArray(clarification.options) ||
+    typeof clarification.reason !== "string"
+  ) {
+    return undefined;
+  }
+
+  const steps = normalizeClarificationSteps(clarification.steps);
+
+  return {
+    is_complete: clarification.is_complete,
+    question: clarification.question,
+    missing_fields: clarification.missing_fields,
+    options: normalizeClarificationOptions(clarification.options),
+    ...(steps.length > 0 ? { steps } : {}),
+    reason: clarification.reason,
+  };
 }
 
 function createTraceEvent(data: Partial<AgentTraceEvent>): AgentTraceEvent {
@@ -108,33 +264,229 @@ function createTraceEvent(data: Partial<AgentTraceEvent>): AgentTraceEvent {
   return {
     id: createId(),
     type,
-    title: data.title || getTraceTypeLabel(type),
+    title: data.title || "Событие выполнения",
     tool: data.tool,
-    payload: data.payload,
+    payload: undefined,
+    phase: data.phase,
+    status: data.status === "done" ? "done" : "running",
+    visibility: data.visibility,
     createdAt: nowIso(),
   };
 }
 
-function getTraceTypeLabel(type: AgentTraceEvent["type"]): string {
-  switch (type) {
-    case "tool_call":
-      return "Вызов";
-    case "tool_result":
-      return "Результат";
-    case "iteration":
-      return "Итерация";
-    default:
-      return "Мысль";
+type ExecutionStreamItem = {
+  id: string;
+  phase: AgentTracePhase;
+  title: string;
+  status: AgentTraceStatus;
+  details: AgentTraceEvent[];
+  retryCount: number;
+  hasSummary: boolean;
+  clarifications: Array<{
+    id: string;
+    question: string;
+    reason: string;
+    selectedLabel?: string;
+    pending: boolean;
+  }>;
+};
+
+const tracePhaseOrder: AgentTracePhase[] = [
+  "analysis",
+  "planning",
+  "retrieval",
+  "sql",
+  "calculation",
+  "validation",
+  "finalization",
+  "clarification",
+];
+
+const tracePhaseTitles: Record<AgentTracePhase, string> = {
+  analysis: "Анализирую запрос",
+  planning: "Планирую получение данных",
+  retrieval: "Ищу подходящие датасеты",
+  sql: "Проверяю данные через SQL",
+  calculation: "Считаю показатели",
+  validation: "Проверяю качество ответа",
+  finalization: "Готовлю итоговый ответ",
+  clarification: "Уточняю параметры",
+};
+
+function inferTracePhase(trace: AgentTraceEvent): AgentTracePhase {
+  if (trace.phase) return trace.phase;
+  const tool = (trace.tool || "").toLowerCase();
+  const title = trace.title.toLowerCase();
+
+  if (tool.includes("request_user_clarification") || title.includes("уточнен")) return "clarification";
+  if (tool.includes("submit_data_acquisition_plan") || title.includes("план")) return "planning";
+  if (
+    tool.includes("request_evidence") ||
+    tool.includes("query_enricher") ||
+    tool.includes("pgvector") ||
+    tool.includes("rag") ||
+    tool.includes("technical_dataset_filter") ||
+    title.includes("rag") ||
+    title.includes("датасет")
+  ) {
+    return "retrieval";
   }
+  if (
+    tool.includes("evidence_agent") ||
+    tool.includes("duckdb") ||
+    tool.includes("parquet") ||
+    tool.includes("sql") ||
+    title.includes("sql")
+  ) {
+    return "sql";
+  }
+  if (tool.includes("calculate") || title.includes("счит")) return "calculation";
+  if (
+    title.includes("невалид") ||
+    title.includes("пустой") ||
+    title.includes("ошибка") ||
+    title.includes("повторн") ||
+    title.includes("retry")
+  ) {
+    return "validation";
+  }
+  if (tool.includes("finalizer") || title.includes("финал") || title.includes("ответ") || title.includes("готов")) {
+    return "finalization";
+  }
+  return "analysis";
 }
 
-function formatTracePayload(payload: unknown): string {
-  if (payload === undefined || payload === null) return "";
-  try {
-    return JSON.stringify(payload, null, 2);
-  } catch {
-    return String(payload);
+function inferTraceStatus(trace: AgentTraceEvent): AgentTraceStatus {
+  if (trace.status) return trace.status;
+  const title = trace.title.toLowerCase();
+  if (title.includes("ошибка") || title.includes("error")) return "error";
+  if (title.includes("повторн") || title.includes("retry")) return "retry";
+
+  return trace.type === "tool_call" ? "running" : "done";
+}
+
+function inferTraceVisibility(trace: AgentTraceEvent): AgentTraceVisibility {
+  if (trace.visibility) return trace.visibility;
+  if (trace.type === "thought" || trace.type === "iteration") return "summary";
+
+  const phase = inferTracePhase(trace);
+  const title = trace.title.toLowerCase();
+  if (
+    phase === "planning" ||
+    phase === "finalization" ||
+    title.includes("датасеты, использованные") ||
+    title.includes("evidence pack готов") ||
+    title.includes("ответ основного агента готов")
+  ) {
+    return "summary";
   }
+
+  return "detail";
+}
+
+function compareTracePhases(left: AgentTracePhase, right: AgentTracePhase): number {
+  return tracePhaseOrder.indexOf(left) - tracePhaseOrder.indexOf(right);
+}
+
+function buildExecutionStream(
+  traces: AgentTraceEvent[],
+  history: ClarificationTurn[],
+  currentClarification: ClarificationResult | undefined,
+  isActive: boolean,
+): ExecutionStreamItem[] {
+  const items = new Map<AgentTracePhase, ExecutionStreamItem>();
+
+  function ensureItem(phase: AgentTracePhase): ExecutionStreamItem {
+    const existing = items.get(phase);
+    if (existing) return existing;
+
+    const item: ExecutionStreamItem = {
+      id: phase,
+      phase,
+      title: tracePhaseTitles[phase],
+      status: "done",
+      details: [],
+      retryCount: 0,
+      hasSummary: false,
+      clarifications: [],
+    };
+    items.set(phase, item);
+    return item;
+  }
+
+  traces.forEach((trace) => {
+    const phase = inferTracePhase(trace);
+    const status = inferTraceStatus(trace);
+    const visibility = inferTraceVisibility(trace);
+    const item = ensureItem(phase);
+
+    item.details.push(trace);
+    if (visibility === "summary") {
+      item.title = trace.title;
+      item.hasSummary = true;
+    }
+    if (status === "retry") item.retryCount += 1;
+    if (status === "error") {
+      item.status = "error";
+    } else if (status === "done" && item.status !== "error") {
+      item.status = "done";
+    } else if (item.status !== "error" && status === "retry") {
+      item.status = "retry";
+    }
+  });
+
+  history.forEach((turn) => {
+    const item = ensureItem("clarification");
+    item.hasSummary = true;
+    item.clarifications.push({
+      id: turn.id,
+      question: turn.clarification.question || "Уточнение",
+      reason: turn.clarification.reason,
+      selectedLabel: turn.selectedOption.label,
+      pending: false,
+    });
+  });
+
+  if (currentClarification) {
+    const item = ensureItem("clarification");
+    item.hasSummary = true;
+    item.status = "running";
+    item.clarifications.push({
+      id: "current",
+      question: currentClarification.question || "Нужно уточнение",
+      reason: currentClarification.reason,
+      pending: true,
+    });
+  }
+
+  const result = [...items.values()].sort((left, right) => compareTracePhases(left.phase, right.phase));
+  if (isActive && result.length > 0) {
+    const lastRunnable = [...result].reverse().find((item) => item.status !== "error");
+    if (lastRunnable) lastRunnable.status = "running";
+  }
+  return result;
+}
+
+function compactExecutionItems(items: ExecutionStreamItem[]): ExecutionStreamItem[] {
+  const important = items.filter(
+    (item) =>
+      item.hasSummary ||
+      item.status === "error" ||
+      item.phase === "retrieval" ||
+      item.phase === "sql" ||
+      item.phase === "clarification" ||
+      item.phase === "finalization",
+  );
+  const compact = important.length > 0 ? important : items;
+  return compact.slice(0, 4);
+}
+
+function executionStatusLabel(status: AgentTraceStatus): string {
+  return status === "done" ? "готово" : "в процессе";
+}
+
+function executionStatusClass(status: AgentTraceStatus): string {
+  return status === "done" ? "bg-emerald-500" : "bg-sky-500";
 }
 
 type AnswerBlock =
@@ -320,9 +672,84 @@ function joinTableRow(row: string[]): string {
   return `| ${row.join(" | ")} |`;
 }
 
+function tableToCsv(headers: string[], rows: string[][]): string {
+  return [headers, ...rows]
+    .map((row) => row.map(csvCell).join(","))
+    .join("\n");
+}
+
+function csvCell(value: string): string {
+  const normalized = value.replace(/\r?\n/g, " ").trim();
+  return /[",\n]/.test(normalized) ? `"${normalized.replaceAll("\"", "\"\"")}"` : normalized;
+}
+
+function downloadCsv(filename: string, content: string): void {
+  const blob = new Blob([`\uFEFF${content}`], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function csvFilename(sectionTitle: string | undefined, blockIndex: number): string {
+  const slug = (sectionTitle || "table")
+    .toLowerCase()
+    .replaceAll("ё", "е")
+    .replace(/[^a-zа-я0-9]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return `${slug || "table"}-${blockIndex + 1}.csv`;
+}
+
 function renderInline(text: string): ReactNode[] {
-  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).filter(Boolean);
+  const parts = text.split(/(\[[^\]]+\]\([^)]+\)|`[^`]+`|\*\*[^*]+\*\*)/g).filter(Boolean);
   return parts.map((part, index) => {
+    const link = part.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+    if (link) {
+      const href = link[2];
+      const rollbackPrefix = "rollback://checkpoint/";
+      if (href.startsWith(rollbackPrefix)) {
+        const checkpointId = href.slice(rollbackPrefix.length);
+        return (
+          <button
+            key={`${part}-${index}`}
+            type="button"
+            className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-sm font-semibold text-amber-900 shadow-sm transition hover:border-amber-300 hover:bg-amber-100"
+            onClick={async () => {
+              if (!window.confirm("Откатить диалог к этому состоянию?")) return;
+              const response = await fetch(`/invoke/checkpoints/${checkpointId}/rollback`, {
+                method: "POST",
+                headers: chatClientHeaders(),
+              });
+              if (!response.ok) {
+                window.alert("Не удалось выполнить откат.");
+                return;
+              }
+              window.location.reload();
+            }}
+          >
+            {link[1]}
+          </button>
+        );
+      }
+
+      return (
+        <a
+          key={`${part}-${index}`}
+          className="font-semibold text-sky-700 underline decoration-sky-300 underline-offset-4 transition hover:text-sky-900"
+          href={href}
+          target={href.startsWith("/") ? undefined : "_blank"}
+          rel={href.startsWith("/") ? undefined : "noreferrer"}
+        >
+          {link[1]}
+        </a>
+      );
+    }
+
     if (part.startsWith("`") && part.endsWith("`")) {
       return (
         <code
@@ -383,6 +810,8 @@ function AnswerSectionView({ section }: { section: AnswerSection }): ReactNode {
             key={`${block.type}-${index}`}
             block={block}
             datasetMode={datasetMode}
+            blockIndex={index}
+            sectionTitle={title}
           />
         ))}
       </div>
@@ -390,14 +819,24 @@ function AnswerSectionView({ section }: { section: AnswerSection }): ReactNode {
   );
 }
 
-function AnswerBlockView({ block, datasetMode }: { block: AnswerBlock; datasetMode: boolean }): ReactNode {
+function AnswerBlockView({
+  block,
+  datasetMode,
+  blockIndex,
+  sectionTitle,
+}: {
+  block: AnswerBlock;
+  datasetMode: boolean;
+  blockIndex: number;
+  sectionTitle?: string;
+}): ReactNode {
   if (block.type === "code") {
     const language = block.language || "text";
     return (
       <div className="overflow-hidden rounded-lg border border-neutral-800 bg-neutral-950">
         <div className="flex h-9 items-center justify-between border-b border-white/10 px-3 text-xs text-neutral-300">
           <span className="font-medium uppercase tracking-wide">{language}</span>
-          {language.toLowerCase() === "sql" && <span>Analyst SQL</span>}
+          {language.toLowerCase() === "sql" && <span>Аналитический SQL</span>}
         </div>
         <pre className="max-h-[420px] overflow-auto p-4 text-[13px] leading-6 text-neutral-100">
           <code>{block.code}</code>
@@ -435,8 +874,18 @@ function AnswerBlockView({ block, datasetMode }: { block: AnswerBlock; datasetMo
   }
 
   if (block.type === "table") {
+    const filename = csvFilename(sectionTitle, blockIndex);
     return (
       <div className="overflow-hidden rounded-lg border border-neutral-200 bg-white">
+        <div className="flex items-center justify-end border-b border-neutral-100 bg-neutral-50 px-3 py-2">
+          <button
+            type="button"
+            className="inline-flex min-h-8 items-center rounded-md border border-neutral-200 bg-white px-3 text-xs font-semibold text-neutral-800 shadow-sm transition hover:border-neutral-300 hover:bg-neutral-100"
+            onClick={() => downloadCsv(filename, tableToCsv(block.headers, block.rows))}
+          >
+            Скачать CSV
+          </button>
+        </div>
         <div className="overflow-x-auto">
           <table className="min-w-full border-collapse text-sm">
             <thead className="bg-neutral-50">
@@ -478,15 +927,16 @@ function AnswerBlockView({ block, datasetMode }: { block: AnswerBlock; datasetMo
 }
 
 function App() {
-  const [chatState, setChatState] = useState<PersistedChatState>(() => loadChatState());
+  const [chatState, setChatState] = useState<PersistedChatState>(emptyState);
+  const [chatStateLoaded, setChatStateLoaded] = useState(false);
   const [input, setInput] = useState("");
   const [mode, setMode] = useState<SendMode>("normal");
   const [streamingSessionId, setStreamingSessionId] = useState<string | null>(null);
-  const [clarifyingSessionId, setClarifyingSessionId] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sessionFilter, setSessionFilter] = useState("");
   const [error, setError] = useState<string | null>(null);
   const sourceRef = useRef<EventSource | null>(null);
+  const traceCountsRef = useRef<Record<string, number>>({});
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -495,16 +945,45 @@ function App() {
     [chatState.activeSessionId, chatState.sessions],
   );
 
-  const isClarifying = Boolean(clarifyingSessionId);
-  const isStreaming = Boolean(streamingSessionId || clarifyingSessionId);
+  const isStreaming = Boolean(streamingSessionId);
   const latestAssistantMessage = [...(activeSession?.messages ?? [])]
     .reverse()
     .find((message) => message.role === "assistant");
   const canShowCopy = Boolean(latestAssistantMessage?.content.trim()) && !isStreaming;
 
   useEffect(() => {
-    saveChatState(chatState);
-  }, [chatState]);
+    let cancelled = false;
+    void loadChatState()
+      .then((state) => {
+        if (cancelled) return;
+        setChatState(state);
+        setChatStateLoaded(true);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setError("Историю чатов из Postgres загрузить не удалось.");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!chatStateLoaded) return;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      void saveChatState(chatState, controller.signal).catch((reason) => {
+        if (reason instanceof DOMException && reason.name === "AbortError") return;
+        setError("Историю чатов в Postgres сохранить не удалось.");
+      });
+    }, 300);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [chatState, chatStateLoaded]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ block: "end" });
@@ -527,6 +1006,10 @@ function App() {
   }
 
   function createNewChat(): void {
+    if (!chatStateLoaded) {
+      setError("История чатов еще загружается.");
+      return;
+    }
     const session = createSession();
     setChatState((current) => ({
       version: 1,
@@ -553,7 +1036,7 @@ function App() {
   }
 
   function selectSession(sessionId: string): void {
-    if (isStreaming) return;
+    if (isStreaming || !chatStateLoaded) return;
     setChatState((current) => ({ ...current, activeSessionId: sessionId }));
     setMode("normal");
     setError(null);
@@ -561,7 +1044,7 @@ function App() {
   }
 
   function deleteSession(sessionId: string): void {
-    if (streamingSessionId === sessionId) return;
+    if (streamingSessionId === sessionId || !chatStateLoaded) return;
     setChatState((current) => {
       const sessions = current.sessions.filter((session) => session.id !== sessionId);
       const activeSessionId = current.activeSessionId === sessionId ? sessions[0]?.id : current.activeSessionId;
@@ -591,6 +1074,7 @@ function App() {
   }
 
   function appendAssistantTrace(sessionId: string, assistantMessageId: string, trace: AgentTraceEvent): void {
+    traceCountsRef.current[assistantMessageId] = (traceCountsRef.current[assistantMessageId] ?? 0) + 1;
     updateSessions((sessions) =>
       sessions.map((session) => {
         if (session.id !== sessionId) return session;
@@ -612,6 +1096,7 @@ function App() {
     assistantMessageId: string,
     clarification: ChatMessage["clarification"],
     status: ChatMessage["clarificationStatus"],
+    traceEnd: number,
   ): void {
     updateSessions((sessions) =>
       sessions.map((session) => {
@@ -620,7 +1105,15 @@ function App() {
           ...session,
           updatedAt: nowIso(),
           messages: session.messages.map((message) =>
-            message.id === assistantMessageId ? { ...message, clarification, clarificationStatus: status } : message,
+            message.id === assistantMessageId
+              ? {
+                  ...message,
+                  content: status === "pending" ? "" : message.content,
+                  clarification,
+                  clarificationStatus: status,
+                  clarificationTraceEnd: traceEnd,
+                }
+              : message,
           ),
         };
       }),
@@ -689,12 +1182,17 @@ function App() {
   function startStream(
     session: ChatSession,
     message: string,
+    userMessageId: string,
     assistantMessageId: string,
     sendMode: SendMode,
   ): void {
     closeCurrentStream();
     setError(null);
     setStreamingSessionId(session.id);
+    traceCountsRef.current[assistantMessageId] =
+      session.messages.find((item) => item.id === assistantMessageId)?.agentTrace?.length ??
+      traceCountsRef.current[assistantMessageId] ??
+      0;
 
     const source = new EventSource(createChatStreamUrl(message, session.conversationId, sendMode));
     sourceRef.current = source;
@@ -730,6 +1228,30 @@ function App() {
       }
     });
 
+    source.addEventListener("clarification", (event) => {
+      try {
+        const data = JSON.parse(event.data || "{}") as unknown;
+        const clarification = parseStreamClarification(data);
+        if (!clarification || clarification.is_complete) return;
+        const traceEnd = traceCountsRef.current[assistantMessageId] ?? 0;
+
+        updateAssistantClarification(session.id, assistantMessageId, clarification, "pending", traceEnd);
+        setPendingClarification(session.id, {
+          id: createId(),
+          message,
+          sendMode,
+          assistantMessageId,
+          userMessageId,
+          clarification,
+          traceEnd,
+          createdAt: nowIso(),
+        });
+        closeCurrentStream();
+      } catch {
+        // Ignore malformed clarification events.
+      }
+    });
+
     source.addEventListener("done", () => {
       closeCurrentStream();
     });
@@ -741,46 +1263,14 @@ function App() {
     };
   }
 
-  async function clarifyBeforeNextStep(
-    session: ChatSession,
-    message: string,
-    sendMode: SendMode,
-    userMessageId: string,
-    assistantMessageId: string,
-  ): Promise<void> {
-    setClarifyingSessionId(session.id);
-    setError(null);
-
-    try {
-      const clarification = await clarifyMissing(message, session.conversationId);
-      if (clarification.is_complete) {
-        startStream(session, message, assistantMessageId, sendMode);
-        return;
-      }
-
-      updateAssistantClarification(session.id, assistantMessageId, clarification, "pending");
-      setPendingClarification(session.id, {
-        id: createId(),
-        message,
-        sendMode,
-        assistantMessageId,
-        userMessageId,
-        clarification,
-        createdAt: nowIso(),
-      });
-    } catch {
-      setError("Не удалось уточнить запрос. Попробуйте отправить сообщение еще раз.");
-      appendAssistantChunk(session.id, assistantMessageId, "\n\n[Ошибка уточнения]");
-    } finally {
-      setClarifyingSessionId(null);
-    }
-  }
-
   function chooseClarificationOption(option: ClarificationOption): void {
     if (!activeSession?.pendingClarification || isStreaming) return;
 
     const pending = activeSession.pendingClarification;
-    if (option.value === "manual") {
+    const steps = clarificationSteps(pending.clarification);
+    const stepIndex = Math.min(pending.stepIndex ?? 0, steps.length - 1);
+    const currentClarification = clarificationForStep(pending.clarification, steps[stepIndex]);
+    if (isManualClarificationOption(option)) {
       updateSessions((sessions) =>
         sessions.map((session) => {
           if (session.id !== activeSession.id) return session;
@@ -802,6 +1292,49 @@ function App() {
 
     const clarifiedMessage = appendClarificationValue(pending.message, option.value);
     const timestamp = nowIso();
+    const answeredTurn: ClarificationTurn = {
+      id: `${pending.id}-${stepIndex}`,
+      clarification: cloneClarification(currentClarification),
+      selectedOption: { ...option },
+      traceEnd: pending.traceEnd,
+      createdAt: timestamp,
+    };
+    const nextStepIndex = stepIndex + 1;
+
+    if (nextStepIndex < steps.length) {
+      const nextClarification = clarificationForStep(pending.clarification, steps[nextStepIndex]);
+      updateSessions((sessions) =>
+        sessions.map((session) => {
+          if (session.id !== activeSession.id) return session;
+
+          const messages = session.messages.map((message) =>
+            message.id === pending.userMessageId
+              ? { ...message, content: clarifiedMessage }
+              : message.id === pending.assistantMessageId
+                ? {
+                    ...message,
+                    clarification: cloneClarification(nextClarification),
+                    clarificationStatus: "pending" as const,
+                    clarificationTraceEnd: pending.traceEnd,
+                    clarificationHistory: mergeClarificationHistory(message.clarificationHistory, answeredTurn),
+                  }
+                : message,
+          );
+
+          return {
+            ...session,
+            updatedAt: timestamp,
+            pendingClarification: {
+              ...pending,
+              message: clarifiedMessage,
+              stepIndex: nextStepIndex,
+            },
+            messages,
+          };
+        }),
+      );
+      return;
+    }
 
     updateSessions((sessions) =>
       sessions.map((session) => {
@@ -811,12 +1344,18 @@ function App() {
           message.id === pending.userMessageId
             ? { ...message, content: clarifiedMessage }
             : message.id === pending.assistantMessageId
-              ? { ...message, clarification: pending.clarification, clarificationStatus: "answered" as const }
+              ? {
+                  ...message,
+                  clarification: undefined,
+                  clarificationStatus: undefined,
+                  clarificationTraceEnd: undefined,
+                  clarificationHistory: mergeClarificationHistory(message.clarificationHistory, answeredTurn),
+                }
               : message,
         );
         const checkpoint: ChatCheckpoint = {
           id: pending.id,
-          title: `${pending.clarification.question || "Уточнение"}: ${option.label}`,
+          title: `${currentClarification.question || "Уточнение"}: ${option.label}`,
           createdAt: timestamp,
           pendingClarification: { ...pending, clarification: cloneClarification(pending.clarification) },
           messages: cloneMessages(activeSession.messages),
@@ -832,7 +1371,7 @@ function App() {
       }),
     );
 
-    startStream(activeSession, clarifiedMessage, pending.assistantMessageId, pending.sendMode);
+    startStream(activeSession, clarifiedMessage, pending.userMessageId, pending.assistantMessageId, pending.sendMode);
   }
 
   function rollbackToCheckpoint(checkpointId: string): void {
@@ -870,6 +1409,10 @@ function App() {
     event?.preventDefault();
     const message = input.trim();
     if (!message || isStreaming) return;
+    if (!chatStateLoaded) {
+      setError("История чатов еще загружается.");
+      return;
+    }
 
     const session = ensureActiveSession();
     const sendMode = mode;
@@ -877,12 +1420,7 @@ function App() {
     setInput("");
     setMode("normal");
 
-    if (sendMode === "normal") {
-      await clarifyBeforeNextStep(session, message, sendMode, userMessage.id, assistantMessage.id);
-      return;
-    }
-
-    startStream(session, message, assistantMessage.id, sendMode);
+    startStream(session, message, userMessage.id, assistantMessage.id, sendMode);
   }
 
   function sendStarterPrompt(): void {
@@ -901,6 +1439,112 @@ function App() {
   function copyLatestAnswer(): void {
     if (!latestAssistantMessage?.content.trim()) return;
     void navigator.clipboard?.writeText(latestAssistantMessage.content);
+  }
+
+  function renderExecutionStreamItem(item: ExecutionStreamItem): ReactNode {
+    return (
+      <div key={item.id} className="rounded-lg border border-neutral-200 bg-white px-3 py-2">
+        <div className="flex items-start gap-3">
+          <span className="mt-1 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-neutral-100">
+            <span className={cx("h-2 w-2 rounded-full", executionStatusClass(item.status))} />
+          </span>
+          <div className="min-w-0 flex-1 space-y-1">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
+              <span className="font-medium text-neutral-950">{item.title}</span>
+              <span className="rounded-full bg-neutral-100 px-2 py-0.5 text-[11px] font-medium text-neutral-500">
+                {executionStatusLabel(item.status)}
+              </span>
+            </div>
+            {item.clarifications.map((clarification) => (
+              <div key={clarification.id} className="text-sm leading-6 text-neutral-700">
+                <span>{clarification.question}</span>
+                {clarification.selectedLabel && (
+                  <span className="font-medium text-neutral-950"> Выбрано: {clarification.selectedLabel}</span>
+                )}
+                {clarification.pending && (
+                  <span className="font-medium text-neutral-950"> Выберите вариант над полем ввода.</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function renderExecutionTimeline(message: ChatMessage): ReactNode {
+    const traces = message.agentTrace ?? [];
+    const history = message.clarificationHistory ?? [];
+    const isActiveMessage = activeSession?.id === streamingSessionId && latestAssistantMessage?.id === message.id;
+    const streamItems = buildExecutionStream(traces, history, message.clarification, Boolean(isActiveMessage));
+    if (streamItems.length === 0) return null;
+
+    const visibleItems = compactExecutionItems(streamItems);
+    const hiddenCount = Math.max(streamItems.length - visibleItems.length, 0);
+
+    return (
+      <div
+        className="mb-4 max-w-[720px] whitespace-normal rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm leading-6 text-neutral-800"
+        data-trace-ui={executionStreamUiRevision}
+      >
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <span className="font-medium text-neutral-950">Выполнение</span>
+          <span className="rounded-full bg-white px-2 py-0.5 text-xs text-neutral-500 ring-1 ring-neutral-200">
+            {isActiveMessage ? "идёт поток" : "сводка"}
+          </span>
+        </div>
+        <div className="space-y-2">{visibleItems.map(renderExecutionStreamItem)}</div>
+        {hiddenCount > 0 && (
+          <details className="mt-2 rounded-lg border border-neutral-200 bg-white px-3 py-2">
+            <summary className="cursor-pointer list-none text-xs font-medium text-neutral-500 transition hover:text-neutral-900">
+              Показать ещё {hiddenCount}
+            </summary>
+            <div className="mt-2 space-y-2">
+              {streamItems.filter((item) => !visibleItems.includes(item)).map(renderExecutionStreamItem)}
+            </div>
+          </details>
+        )}
+      </div>
+    );
+  }
+
+  function renderPendingClarificationPanel(): ReactNode {
+    const pending = activeSession?.pendingClarification;
+    if (!pending) return null;
+
+    const clarification = currentPendingClarification(pending);
+    const options = clarification.options.length > 0
+      ? clarification.options
+      : [{ label: "Ввести вручную", value: "manual" }];
+
+    return (
+      <div className="mb-3 rounded-xl border border-neutral-200 bg-white px-4 py-3 text-sm shadow-[0_12px_40px_rgba(0,0,0,0.08)]">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="min-w-0 flex-1">
+            <div className="text-xs font-medium uppercase text-neutral-500">Нужно уточнение</div>
+            <div className="mt-1 font-medium leading-6 text-neutral-950">
+              {clarification.question || "Уточните параметры запроса"}
+            </div>
+            {clarification.reason && (
+              <div className="mt-1 text-xs leading-5 text-neutral-500">{clarification.reason}</div>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-2 sm:max-w-[52%] sm:justify-end">
+            {options.map((option) => (
+              <button
+                key={`${pending.id}-${option.value}`}
+                type="button"
+                className="inline-flex min-h-9 items-center rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-1.5 text-sm font-medium text-neutral-800 transition hover:border-neutral-300 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={() => chooseClarificationOption(option)}
+                disabled={isStreaming}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
   }
 
   const normalizedSessionFilter = sessionFilter.trim().toLowerCase();
@@ -1018,15 +1662,21 @@ function App() {
             >
               <Menu size={21} />
             </button>
-            <div className="mx-auto flex w-full max-w-4xl items-center">
-              <div className="min-w-0 flex-1">
-                <h1 className="truncate text-base font-medium text-neutral-900">
-                  {activeSession?.title || "MathMod DataAgent"}
-                </h1>
-              </div>
-              <div className="text-sm text-neutral-500">
-                {isClarifying ? "Уточняю запрос" : streamingSessionId ? "Ответ формируется" : "Готов к запросу"}
-              </div>
+            <div className="flex items-center gap-3">
+              <span className="inline-flex items-center gap-2 rounded-full bg-neutral-900/90 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-white">
+                <span className="h-2 w-2 rounded-full bg-cyan-300" />
+                MathMod DataAgent
+              </span>
+            </div>
+            <div className="min-w-0 flex-1">
+              <h1 className="truncate text-base font-medium text-neutral-900">
+                {activeSession?.title || "Диалог"}
+              </h1>
+            </div>
+            <div className="ml-auto flex items-center gap-3">
+              <span className="text-sm text-neutral-500">
+                {streamingSessionId ? "Ответ формируется" : activeSession?.pendingClarification ? "Нужно уточнение" : "Готов к запросу"}
+              </span>
             </div>
           </header>
 
@@ -1038,7 +1688,7 @@ function App() {
                     <div className="mb-5 grid h-14 w-14 place-items-center rounded-2xl bg-neutral-950 text-white">
                       <MessageSquarePlus size={26} />
                     </div>
-                    <h2 className="text-2xl font-semibold tracking-normal text-neutral-950">MathMod DataAgent</h2>
+                    <h2 className="text-2xl font-semibold tracking-normal text-neutral-950">Сформируем данные по вашему запросу</h2>
                     <button
                       type="button"
                       className="mt-6 max-w-xl rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-left text-sm leading-6 text-neutral-700 transition hover:bg-neutral-100 hover:text-neutral-950"
@@ -1061,98 +1711,20 @@ function App() {
                         message.role === "user"
                           ? "rounded-[24px] bg-[#f4f4f4] px-5 py-3 text-neutral-950"
                           : "px-0 py-1 text-neutral-900",
-                        message.content.length === 0 && !message.clarification && "min-h-12 min-w-24",
+                        message.content.length === 0 &&
+                          !message.clarification &&
+                          !message.clarificationHistory?.length &&
+                          "min-h-12 min-w-24",
                       )}
                     >
-                      {message.clarification && (
-                        <div className="mb-4 max-w-[640px] whitespace-normal rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm leading-6 text-neutral-800">
-                          <div className="font-medium text-neutral-950">
-                            {message.clarification.question || "Нужно уточнение"}
-                          </div>
-                          {message.clarification.reason && (
-                            <div className="mt-2 text-neutral-700">{message.clarification.reason}</div>
-                          )}
-                          {message.clarificationStatus === "pending" && (
-                            <div className="mt-3 flex flex-wrap gap-2">
-                              {message.clarification.options.map((option) => (
-                                <button
-                                  key={`${message.id}-${option.value}`}
-                                  type="button"
-                                  className="inline-flex min-h-9 items-center rounded-lg border border-neutral-200 bg-white px-3 py-1.5 text-sm text-neutral-800 transition hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-50"
-                                  onClick={() => chooseClarificationOption(option)}
-                                  disabled={isStreaming}
-                                >
-                                  {option.label}
-                                </button>
-                              ))}
-                            </div>
-                          )}
-                          {message.clarificationStatus === "answered" && (
-                            <div className="mt-3 text-xs font-medium text-neutral-500">Уточнение применено</div>
-                          )}
-                        </div>
-                      )}
-                      {message.role === "assistant" && message.agentTrace && message.agentTrace.length > 0 && (
-                        <details
-                          className="group mb-4 max-w-[720px] whitespace-normal rounded-xl border border-neutral-200 bg-white px-4 py-3 text-sm leading-6 text-neutral-800 shadow-sm"
-                          open
-                        >
-                          <summary className="mb-3 flex cursor-pointer list-none items-center justify-between gap-3">
-                            <span className="font-medium text-neutral-950">Ход выполнения</span>
-                            <span className="flex items-center gap-2">
-                              <span className="rounded-full bg-neutral-100 px-2 py-0.5 text-xs text-neutral-500">
-                                {message.agentTrace.length} шагов
-                              </span>
-                              <span className="text-xs text-neutral-400 group-open:hidden">показать</span>
-                              <span className="text-xs text-neutral-400 group-open:inline hidden">свернуть</span>
-                            </span>
-                          </summary>
-                          <div className="space-y-2">
-                            {message.agentTrace.map((trace, index) => {
-                              const payload = formatTracePayload(trace.payload);
-                              return (
-                                <details
-                                  key={trace.id}
-                                  className="group rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2"
-                                >
-                                  <summary className="flex cursor-pointer list-none items-start gap-3">
-                                    <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-white text-xs font-semibold text-neutral-700 ring-1 ring-neutral-200">
-                                      {index + 1}
-                                    </span>
-                                    <span className="min-w-0 flex-1">
-                                      <span className="flex min-w-0 flex-wrap items-center gap-2">
-                                        <span className="shrink-0 text-xs font-medium uppercase tracking-wide text-neutral-500">
-                                          {getTraceTypeLabel(trace.type)}
-                                        </span>
-                                        <span className="min-w-0 truncate text-sm font-medium text-neutral-950">
-                                          {trace.title}
-                                        </span>
-                                        {trace.tool && (
-                                          <code className="max-w-[240px] truncate rounded bg-white px-1.5 py-0.5 text-xs text-neutral-600 ring-1 ring-neutral-200">
-                                            {trace.tool}
-                                          </code>
-                                        )}
-                                      </span>
-                                    </span>
-                                  </summary>
-                                  {payload && (
-                                    <pre className="mt-3 max-h-80 overflow-auto rounded-lg border border-neutral-200 bg-white p-3 text-xs leading-5 text-neutral-800">
-                                      {payload}
-                                    </pre>
-                                  )}
-                                </details>
-                              );
-                            })}
-                          </div>
-                        </details>
-                      )}
+                      {message.role === "assistant" && renderExecutionTimeline(message)}
                       {message.content ? (
                         message.role === "assistant" ? (
                           <AssistantAnswer content={message.content} />
                         ) : (
                           message.content
                         )
-                      ) : (!message.clarification && (
+                      ) : (!message.clarification && !message.clarificationHistory?.length && (
                           <span className="inline-flex items-center gap-1 text-neutral-500">
                             <span className="h-2 w-2 animate-pulse rounded-full bg-current" />
                             <span className="h-2 w-2 animate-pulse rounded-full bg-current [animation-delay:120ms]" />
@@ -1183,55 +1755,6 @@ function App() {
             </div>
           </section>
 
-          <aside className="fixed right-10 top-24 z-20 hidden max-h-[70vh] w-14 2xl:block">
-            {(activeSession?.checkpoints ?? []).length === 0 && (
-              <div className="flex h-28 flex-col items-center justify-center gap-4">
-                {[0, 1, 2, 3].map((item) => (
-                  <span key={item} className="h-2 w-2 rounded-full bg-neutral-200" aria-hidden="true" />
-                ))}
-              </div>
-            )}
-
-            <div className="max-h-[70vh] overflow-visible py-1">
-              {(activeSession?.checkpoints ?? []).map((checkpoint, index, checkpoints) => {
-                const isLast = index === checkpoints.length - 1;
-                return (
-                  <div key={checkpoint.id} className="group relative flex flex-col items-center">
-                    <button
-                      type="button"
-                      className={cx(
-                        "grid h-10 w-10 place-items-center rounded-full border bg-white text-[11px] font-medium tabular-nums shadow-sm transition hover:border-neutral-950 hover:text-neutral-950 disabled:cursor-not-allowed disabled:opacity-50",
-                        isLast ? "border-sky-400 text-sky-700" : "border-neutral-200 text-neutral-500",
-                      )}
-                      onClick={() => rollbackToCheckpoint(checkpoint.id)}
-                      disabled={isStreaming}
-                      title={formatCheckpointTitle(checkpoint, index)}
-                      aria-label={`Откатиться к чекпоинту ${index + 1}`}
-                    >
-                      {index + 1}
-                    </button>
-
-                    <div className="pointer-events-none absolute right-12 top-0 hidden w-72 rounded-xl border border-neutral-200 bg-white px-4 py-3 text-sm leading-5 text-neutral-800 shadow-[0_18px_50px_rgba(0,0,0,0.14)] group-hover:block">
-                      <div className="font-medium text-neutral-950">{formatCheckpointTitle(checkpoint, index)}</div>
-                      {checkpoint.pendingClarification?.clarification.question && (
-                        <div className="mt-1 text-xs text-neutral-500">
-                          {checkpoint.pendingClarification.clarification.question}
-                        </div>
-                      )}
-                      {checkpoint.pendingClarification?.clarification.reason && (
-                        <div className="mt-2 text-neutral-700">
-                          {checkpoint.pendingClarification.clarification.reason}
-                        </div>
-                      )}
-                    </div>
-
-                    {!isLast && <div className="h-8 w-px bg-neutral-200" aria-hidden="true" />}
-                  </div>
-                );
-              })}
-            </div>
-          </aside>
-
           <footer className="fixed bottom-0 left-0 right-0 bg-gradient-to-t from-white via-white to-white/0 px-4 pb-4 pt-10 lg:left-[260px]">
             <div className="mx-auto w-full max-w-4xl">
               {error && (
@@ -1239,6 +1762,7 @@ function App() {
                   {error}
                 </div>
               )}
+              {renderPendingClarificationPanel()}
               {mode === "clarify" && (
                 <div className="mb-3 flex items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
                   <span>Уточнение заменит последний запрос и ответ.</span>

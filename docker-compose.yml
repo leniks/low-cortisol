@@ -22,6 +22,27 @@ services:
       timeout: 5s
       retries: 5
 
+  chat-postgres:
+    image: postgres:16
+    container_name: matmod-chat-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${CHAT_POSTGRES_DB:-matmod_chat}
+      POSTGRES_USER: ${CHAT_POSTGRES_USER:-matmod_chat}
+      POSTGRES_PASSWORD: ${CHAT_POSTGRES_PASSWORD:-matmod_chat_password}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "${CHAT_POSTGRES_PORT:-5434}:5432"
+    volumes:
+      - ./infra/chat-postgres/data:/var/lib/postgresql/data
+      - ./infra/chat-postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./infra/chat-postgres/backups:/backups
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   agents:
     build:
       context: ./agents
@@ -35,10 +56,7 @@ services:
       YANDEX_LLM_BASE_URL: ${YANDEX_LLM_BASE_URL:-https://llm.api.cloud.yandex.net/v1}
       YANDEX_AI_BASE_URL: ${YANDEX_AI_BASE_URL:-https://llm.api.cloud.yandex.net/foundationModels/v1}
       YANDEX_CHAT_MODEL: ${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}
-      YANDEX_CLASSIFIER_MODEL: ${YANDEX_CLASSIFIER_MODEL:-${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}}
-      YANDEX_CLARIFIER_MODEL: ${YANDEX_CLARIFIER_MODEL:-${YANDEX_CLASSIFIER_MODEL:-${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}}}
-      YANDEX_QUERY_ENRICHER_MODEL: ${YANDEX_QUERY_ENRICHER_MODEL:-${YANDEX_CLASSIFIER_MODEL:-${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}}}
-      YANDEX_RERANKER_MODEL: ${YANDEX_RERANKER_MODEL:-${YANDEX_CLASSIFIER_MODEL:-${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}}}
+      YANDEX_QUERY_ENRICHER_MODEL: ${YANDEX_QUERY_ENRICHER_MODEL:-${YANDEX_CHAT_MODEL:-gpt://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/qwen3.6-35b-a3b/latest}}
       YANDEX_QUERY_EMBEDDING_MODEL: ${YANDEX_QUERY_EMBEDDING_MODEL:-emb://${YANDEX_FOLDER_ID:-b1goa02eskrgbk1pg322}/text-search-query/latest}
       RAG_VECTOR_TABLE: ${RAG_VECTOR_TABLE:-rag_embeddings}
       RAG_EMBEDDING_COLUMN: ${RAG_EMBEDDING_COLUMN:-embedding}
@@ -59,11 +77,15 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      chat-postgres:
+        condition: service_healthy
       agents:
         condition: service_healthy
     environment:
       AGENT_SERVICE_URL: ${AGENT_SERVICE_URL:-http://agents:8001}
       DATABASE_URL: postgresql://${POSTGRES_USER:-matmod}:${POSTGRES_PASSWORD:-matmod_password}@postgres:5432/${POSTGRES_DB:-matmod_rag}
+      CHAT_DATABASE_URL: ${CHAT_DATABASE_URL:-postgresql://matmod_chat:matmod_chat_password@chat-postgres:5432/matmod_chat}
+      CHAT_DB_SCHEMA: ${CHAT_DB_SCHEMA:-chat_history}
       MOCK_MODE: ${MOCK_MODE:-false}
     ports:
       - "${BACKEND_PORT:-8000}:8000"

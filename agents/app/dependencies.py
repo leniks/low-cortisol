@@ -1,34 +1,14 @@
 from app.core.settings import AgentSettings
 from app.integrations.vector_db import PgVectorDatasetRepository
 from app.integrations.yandex_embeddings import YandexEmbeddingClient
-from app.models.parquet_reranker import ParquetReranker
 from app.models.query_enricher import QueryEnricher
 from app.models.rag_retriever import PgVectorRagRetriever
 from app.services.agent_service.main_chat import MainAgentChatService
-from app.models.request_clarifier import RequestClarifier
-from app.models.request_classifier import RequestClassifier
 
 
 _main_agent_chat_service: MainAgentChatService | None = None
-_request_clarifier: RequestClarifier | None = None
-_request_classifier: RequestClassifier | None = None
 _query_enricher: QueryEnricher | None = None
 _rag_retriever: PgVectorRagRetriever | None = None
-_parquet_reranker: ParquetReranker | None = None
-
-
-def get_request_clarifier() -> RequestClarifier:
-    global _request_clarifier
-    if _request_clarifier is None:
-        _request_clarifier = RequestClarifier()
-    return _request_clarifier
-
-
-def get_request_classifier() -> RequestClassifier:
-    global _request_classifier
-    if _request_classifier is None:
-        _request_classifier = RequestClassifier()
-    return _request_classifier
 
 
 def get_query_enricher() -> QueryEnricher:
@@ -65,20 +45,11 @@ def get_rag_retriever() -> PgVectorRagRetriever:
     return _rag_retriever
 
 
-def get_parquet_reranker() -> ParquetReranker:
-    global _parquet_reranker
-    if _parquet_reranker is None:
-        _parquet_reranker = ParquetReranker()
-    return _parquet_reranker
-
-
 def get_main_agent_chat_service() -> MainAgentChatService:
     global _main_agent_chat_service
     if _main_agent_chat_service is None:
         _main_agent_chat_service = MainAgentChatService(
-            classifier=get_request_classifier(),
             query_enricher=get_query_enricher(),
             rag_retriever_factory=get_rag_retriever,
-            parquet_reranker=get_parquet_reranker(),
         )
     return _main_agent_chat_service

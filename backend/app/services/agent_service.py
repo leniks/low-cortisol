@@ -12,7 +12,7 @@ class AgentService:
         self._settings = settings
         self._client = httpx.AsyncClient(
             base_url=self._settings.agent_service_url,
-            timeout=httpx.Timeout(120.0, connect=10.0),
+            timeout=httpx.Timeout(None, connect=10.0),
         )
 
     async def run_stream(
@@ -20,7 +20,6 @@ class AgentService:
         user_query: str,
         conversation_id: str | None = None,
         history: list[dict[str, str]] | None = None,
-        route_decision: dict[str, Any] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         if self._settings.mock_mode:
             thought = "Анализирую запрос и подготавливаю набор данных."
@@ -41,7 +40,6 @@ class AgentService:
             "message": user_query,
             "conversation_id": conversation_id,
             "history": history or [],
-            "route_decision": route_decision,
         }
 
         async with self._client.stream("POST", url, json=payload) as response:
@@ -52,35 +50,3 @@ class AgentService:
                         yield json.loads(line.removeprefix("data: "))
                     except json.JSONDecodeError:
                         continue
-
-    async def classify(
-        self,
-        user_query: str,
-        conversation_id: str | None = None,
-        history: list[dict[str, str]] | None = None,
-    ) -> dict[str, Any]:
-        payload = {
-            "message": user_query,
-            "conversation_id": conversation_id,
-            "history": history or [],
-        }
-
-        response = await self._client.post("/invoke/classify", json=payload)
-        response.raise_for_status()
-        return response.json()
-
-    async def clarify_missing(
-        self,
-        user_query: str,
-        conversation_id: str | None = None,
-        history: list[dict[str, str]] | None = None,
-    ) -> dict[str, Any]:
-        payload = {
-            "message": user_query,
-            "conversation_id": conversation_id,
-            "history": history or [],
-        }
-
-        response = await self._client.post("/invoke/clarify-missing", json=payload)
-        response.raise_for_status()
-        return response.json()

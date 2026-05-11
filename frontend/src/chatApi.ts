@@ -1,4 +1,25 @@
-import type { ChatMessage, ClarificationResult, SendMode } from "./types";
+import type { ChatMessage, SendMode } from "./types";
+
+const CHAT_CLIENT_ID_KEY = "mathmod.chat.clientId.v1";
+let fallbackChatClientId: string | undefined;
+
+export function getChatClientId(): string {
+  try {
+    const existing = localStorage.getItem(CHAT_CLIENT_ID_KEY);
+    if (existing) return existing;
+
+    const clientId = crypto.randomUUID();
+    localStorage.setItem(CHAT_CLIENT_ID_KEY, clientId);
+    return clientId;
+  } catch {
+    fallbackChatClientId ??= crypto.randomUUID();
+    return fallbackChatClientId;
+  }
+}
+
+export function chatClientHeaders(): HeadersInit {
+  return { "X-Client-Id": getChatClientId() };
+}
 
 export function createChatStreamUrl(
   message: string,
@@ -15,29 +36,12 @@ export function createChatStreamUrl(
   return `${baseUrl}?${params.toString()}`;
 }
 
-export async function clarifyMissing(
-  message: string,
-  conversationId: string | undefined,
-): Promise<ClarificationResult> {
-  const response = await fetch("/invoke/clarify-missing", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, conversation_id: conversationId }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Clarifier request failed: ${response.status}`);
-  }
-
-  return (await response.json()) as ClarificationResult;
-}
-
 export async function syncDialog(conversationId: string | undefined, messages: ChatMessage[]): Promise<void> {
   if (!conversationId) return;
 
   await fetch("/invoke/dialog", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...chatClientHeaders() },
     body: JSON.stringify({
       conversation_id: conversationId,
       dialog: messages

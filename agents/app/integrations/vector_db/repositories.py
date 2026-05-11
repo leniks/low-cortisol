@@ -102,9 +102,6 @@ class PgVectorDatasetRepository:
 
         if not dataset_id:
             dataset_id = f"dataset_{index}"
-        if not parquet_uri:
-            return None
-
         distance = _float(row.get("distance"), default=1.0)
         score = max(0.0, 1.0 - distance)
         description = _truncate(description or "", self._description_chars)
@@ -113,6 +110,7 @@ class PgVectorDatasetRepository:
             {
                 "rag_distance": distance,
                 "rag_score": score,
+                "missing_parquet_uri": not bool(parquet_uri),
                 "source_row": _safe_row_metadata(row),
             }
         )

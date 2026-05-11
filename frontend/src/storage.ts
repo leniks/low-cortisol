@@ -1,15 +1,22 @@
 import type {
   AgentTraceEvent,
+  AgentTracePhase,
+  AgentTraceStatus,
+  AgentTraceVisibility,
   ChatCheckpoint,
+  ClarificationField,
+  ClarificationStep,
+  ClarificationTurn,
   ChatMessage,
   ChatSession,
   PendingClarification,
   PersistedChatState,
 } from "./types";
+import { chatClientHeaders } from "./chatApi";
 
-export const STORAGE_KEY = "mathmod.chat.sessions.v1";
+const LEGACY_STORAGE_KEY = "mathmod.chat.sessions.v1";
 
-const emptyState: PersistedChatState = {
+export const emptyState: PersistedChatState = {
   version: 1,
   activeSessionId: undefined,
   sessions: [],
@@ -32,6 +39,22 @@ function isClarificationOption(value: unknown): boolean {
   return typeof option.label === "string" && typeof option.value === "string";
 }
 
+function isClarificationField(value: unknown): value is ClarificationField {
+  return value === "period" || value === "geography" || value === "metric" || value === "formula" || value === "other";
+}
+
+function isClarificationStep(value: unknown): value is ClarificationStep {
+  if (!value || typeof value !== "object") return false;
+  const step = value as Record<string, unknown>;
+  return (
+    isClarificationField(step.field) &&
+    (typeof step.question === "string" || step.question === null || step.question === undefined) &&
+    (typeof step.reason === "string" || step.reason === undefined) &&
+    Array.isArray(step.options) &&
+    step.options.every(isClarificationOption)
+  );
+}
+
 function isClarification(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const clarification = value as Record<string, unknown>;
@@ -42,8 +65,28 @@ function isClarification(value: unknown): boolean {
     clarification.missing_fields.every((field) => typeof field === "string") &&
     Array.isArray(clarification.options) &&
     clarification.options.every(isClarificationOption) &&
+    (clarification.steps === undefined ||
+      (Array.isArray(clarification.steps) && clarification.steps.every(isClarificationStep))) &&
     typeof clarification.reason === "string"
   );
+}
+
+function normalizeClarification(value: NonNullable<ChatMessage["clarification"]>): NonNullable<ChatMessage["clarification"]> {
+  const steps = value.steps?.filter(isClarificationStep).map((step) => ({
+    field: step.field,
+    question: step.question,
+    reason: step.reason,
+    options: step.options.map((option) => ({ ...option })),
+  }));
+
+  return {
+    is_complete: value.is_complete,
+    question: value.question,
+    missing_fields: [...value.missing_fields],
+    options: value.options.map((option) => ({ ...option })),
+    ...(steps && steps.length > 0 ? { steps } : {}),
+    reason: value.reason,
+  };
 }
 
 function normalizeMessage(value: unknown): ChatMessage {
@@ -57,15 +100,21 @@ function normalizeMessage(value: unknown): ChatMessage {
 
   if (isClarification(message.clarification)) {
     const clarification = message.clarification as NonNullable<ChatMessage["clarification"]>;
-    normalized.clarification = {
-      is_complete: clarification.is_complete,
-      question: clarification.question,
-      missing_fields: [...clarification.missing_fields],
-      options: clarification.options.map((option) => ({ ...option })),
-      reason: clarification.reason,
-    };
+    normalized.clarification = normalizeClarification(clarification);
     if (message.clarificationStatus === "pending" || message.clarificationStatus === "answered") {
       normalized.clarificationStatus = message.clarificationStatus;
+    }
+    if (typeof message.clarificationTraceEnd === "number") {
+      normalized.clarificationTraceEnd = Math.max(0, Math.floor(message.clarificationTraceEnd));
+    }
+  }
+
+  if (Array.isArray(message.clarificationHistory)) {
+    const clarificationHistory = message.clarificationHistory
+      .filter(isClarificationTurn)
+      .map(normalizeClarificationTurn);
+    if (clarificationHistory.length > 0) {
+      normalized.clarificationHistory = clarificationHistory;
     }
   }
 
@@ -79,6 +128,29 @@ function normalizeMessage(value: unknown): ChatMessage {
   }
 
   return normalized;
+}
+
+function isClarificationTurn(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const turn = value as Record<string, unknown>;
+  return (
+    typeof turn.id === "string" &&
+    isClarification(turn.clarification) &&
+    isClarificationOption(turn.selectedOption) &&
+    (typeof turn.traceEnd === "number" || turn.traceEnd === undefined) &&
+    typeof turn.createdAt === "string"
+  );
+}
+
+function normalizeClarificationTurn(value: unknown): ClarificationTurn {
+  const turn = value as Record<string, unknown>;
+  return {
+    id: turn.id as string,
+    clarification: normalizeClarification(turn.clarification as NonNullable<ChatMessage["clarification"]>),
+    selectedOption: { ...(turn.selectedOption as ClarificationTurn["selectedOption"]) },
+    traceEnd: typeof turn.traceEnd === "number" ? Math.max(0, Math.floor(turn.traceEnd)) : 0,
+    createdAt: turn.createdAt as string,
+  };
 }
 
 function isAgentTraceEvent(value: unknown): boolean {
@@ -101,8 +173,32 @@ function normalizeAgentTraceEvent(value: unknown): AgentTraceEvent {
     title: trace.title as string,
     tool: typeof trace.tool === "string" ? trace.tool : undefined,
     payload: trace.payload,
+    phase: isAgentTracePhase(trace.phase) ? trace.phase : undefined,
+    status: isAgentTraceStatus(trace.status) ? trace.status : undefined,
+    visibility: isAgentTraceVisibility(trace.visibility) ? trace.visibility : undefined,
     createdAt: trace.createdAt as string,
   };
+}
+
+function isAgentTracePhase(value: unknown): value is AgentTracePhase {
+  return (
+    value === "analysis" ||
+    value === "planning" ||
+    value === "retrieval" ||
+    value === "sql" ||
+    value === "calculation" ||
+    value === "validation" ||
+    value === "finalization" ||
+    value === "clarification"
+  );
+}
+
+function isAgentTraceStatus(value: unknown): value is AgentTraceStatus {
+  return value === "running" || value === "done" || value === "retry" || value === "error";
+}
+
+function isAgentTraceVisibility(value: unknown): value is AgentTraceVisibility {
+  return value === "summary" || value === "detail";
 }
 
 function isPendingClarification(value: unknown): boolean {
@@ -115,6 +211,7 @@ function isPendingClarification(value: unknown): boolean {
     typeof pending.assistantMessageId === "string" &&
     typeof pending.userMessageId === "string" &&
     isClarification(pending.clarification) &&
+    (typeof pending.traceEnd === "number" || pending.traceEnd === undefined) &&
     typeof pending.createdAt === "string"
   );
 }
@@ -128,13 +225,9 @@ function normalizePendingClarification(value: unknown): PendingClarification {
     sendMode: pending.sendMode as PendingClarification["sendMode"],
     assistantMessageId: pending.assistantMessageId as string,
     userMessageId: pending.userMessageId as string,
-    clarification: {
-      is_complete: clarification.is_complete,
-      question: clarification.question,
-      missing_fields: [...clarification.missing_fields],
-      options: clarification.options.map((option) => ({ ...option })),
-      reason: clarification.reason,
-    },
+    clarification: normalizeClarification(clarification),
+    stepIndex: typeof pending.stepIndex === "number" ? Math.max(0, Math.floor(pending.stepIndex)) : undefined,
+    traceEnd: typeof pending.traceEnd === "number" ? Math.max(0, Math.floor(pending.traceEnd)) : 0,
     createdAt: pending.createdAt as string,
   };
 }
@@ -195,31 +288,62 @@ function normalizeSession(session: ChatSession): ChatSession {
 }
 
 function shouldKeepMessage(message: ChatMessage): boolean {
-  return Boolean(message.content.trim() || message.clarification || message.agentTrace?.length);
+  return Boolean(
+    message.content.trim() ||
+    message.clarification ||
+    message.clarificationHistory?.length ||
+    message.agentTrace?.length,
+  );
 }
 
-export function loadChatState(): PersistedChatState {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return emptyState;
-
-    const parsed = JSON.parse(raw) as Partial<PersistedChatState>;
-    if (parsed.version !== 1 || !Array.isArray(parsed.sessions)) {
-      return emptyState;
-    }
-
-    const sessions = parsed.sessions.filter(isSession).map(normalizeSession);
-    const activeSessionId = sessions.some((session) => session.id === parsed.activeSessionId)
-      ? parsed.activeSessionId
-      : sessions[0]?.id;
-
-    return { version: 1, activeSessionId, sessions };
-  } catch {
+export function normalizeChatState(value: unknown): PersistedChatState {
+  if (!value || typeof value !== "object") {
     return emptyState;
   }
+
+  const parsed = value as Partial<PersistedChatState>;
+  if (parsed.version !== 1 || !Array.isArray(parsed.sessions)) {
+    return emptyState;
+  }
+
+  const sessions = parsed.sessions.filter(isSession).map(normalizeSession);
+  const activeSessionId = sessions.some((session) => session.id === parsed.activeSessionId)
+    ? parsed.activeSessionId
+    : sessions[0]?.id;
+
+  return { version: 1, activeSessionId, sessions };
 }
 
-export function saveChatState(state: PersistedChatState): void {
+export async function loadChatState(): Promise<PersistedChatState> {
+  const response = await fetch("/invoke/sessions", {
+    cache: "no-store",
+    headers: chatClientHeaders(),
+  });
+  if (!response.ok) {
+    throw new Error("Chat history request failed");
+  }
+
+  const serverState = normalizeChatState(await response.json());
+  if (serverState.sessions.length > 0) {
+    clearLegacyChatState();
+    return serverState;
+  }
+
+  const legacyState = loadLegacyChatState();
+  if (legacyState.sessions.length === 0) {
+    return serverState;
+  }
+
+  try {
+    await saveChatState(legacyState);
+    clearLegacyChatState();
+  } catch {
+    return legacyState;
+  }
+  return legacyState;
+}
+
+export async function saveChatState(state: PersistedChatState, signal?: AbortSignal): Promise<void> {
   const normalized: PersistedChatState = {
     version: 1,
     activeSessionId: state.activeSessionId,
@@ -229,5 +353,32 @@ export function saveChatState(state: PersistedChatState): void {
     })),
   };
 
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
+  const response = await fetch("/invoke/sessions", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...chatClientHeaders() },
+    body: JSON.stringify(normalized),
+    signal,
+  });
+
+  if (!response.ok) {
+    throw new Error("Chat history save failed");
+  }
+}
+
+function loadLegacyChatState(): PersistedChatState {
+  try {
+    const raw = localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (!raw) return emptyState;
+    return normalizeChatState(JSON.parse(raw));
+  } catch {
+    return emptyState;
+  }
+}
+
+function clearLegacyChatState(): void {
+  try {
+    localStorage.removeItem(LEGACY_STORAGE_KEY);
+  } catch {
+    // Ignore storage access errors in restricted browser contexts.
+  }
 }

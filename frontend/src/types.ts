@@ -5,15 +5,36 @@ export type ClarificationOption = {
   value: string;
 };
 
+export type ClarificationField = "period" | "geography" | "metric" | "formula" | "other";
+
+export type ClarificationStep = {
+  field: ClarificationField;
+  question?: string | null;
+  reason?: string;
+  options: ClarificationOption[];
+};
+
 export type ClarificationResult = {
   is_complete: boolean;
   question?: string | null;
-  missing_fields: Array<"period" | "geography" | "metric" | "other">;
+  missing_fields: ClarificationField[];
   options: ClarificationOption[];
+  steps?: ClarificationStep[];
   reason: string;
 };
 
 export type AgentTraceEventType = "thought" | "tool_call" | "tool_result" | "iteration";
+export type AgentTracePhase =
+  | "analysis"
+  | "planning"
+  | "retrieval"
+  | "sql"
+  | "calculation"
+  | "validation"
+  | "finalization"
+  | "clarification";
+export type AgentTraceStatus = "running" | "done" | "retry" | "error";
+export type AgentTraceVisibility = "summary" | "detail";
 
 export type AgentTraceEvent = {
   id: string;
@@ -21,6 +42,17 @@ export type AgentTraceEvent = {
   title: string;
   tool?: string;
   payload?: unknown;
+  phase?: AgentTracePhase;
+  status?: AgentTraceStatus;
+  visibility?: AgentTraceVisibility;
+  createdAt: string;
+};
+
+export type ClarificationTurn = {
+  id: string;
+  clarification: ClarificationResult;
+  selectedOption: ClarificationOption;
+  traceEnd: number;
   createdAt: string;
 };
 
@@ -31,6 +63,8 @@ export type ChatMessage = {
   createdAt: string;
   clarification?: ClarificationResult;
   clarificationStatus?: "pending" | "answered";
+  clarificationTraceEnd?: number;
+  clarificationHistory?: ClarificationTurn[];
   agentTrace?: AgentTraceEvent[];
 };
 
@@ -41,6 +75,8 @@ export type PendingClarification = {
   assistantMessageId: string;
   userMessageId: string;
   clarification: ClarificationResult;
+  stepIndex?: number;
+  traceEnd: number;
   createdAt: string;
 };
 

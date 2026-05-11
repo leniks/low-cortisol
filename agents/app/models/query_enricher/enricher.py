@@ -1,3 +1,4 @@
+import json
 import re
 
 from agents import Runner
@@ -5,6 +6,7 @@ from agents import Runner
 from app.contracts import EnrichedQuery, UserRequest
 from app.core.settings import AgentSettings
 from app.models.query_enricher.factory import create_query_enricher_agent
+from app.utils.structured_history import build_recent_history_signals
 
 
 class QueryEnricher:
@@ -15,7 +17,7 @@ class QueryEnricher:
     async def enrich(self, request: UserRequest) -> EnrichedQuery:
         agent = self._get_agent()
         result = await Runner.run(agent, [{"role": "user", "content": self._build_prompt(request)}])
-        return self._parse(str(result.final_output or ""), request.message)
+        return self._parse(result.final_output, request.message)
 
     def _get_agent(self):
         if self._agent is None:
@@ -25,22 +27,46 @@ class QueryEnricher:
 
     @staticmethod
     def _build_prompt(request: UserRequest) -> str:
-        history_lines = [
-            f"{item.get('role', 'user')}: {item.get('content', '')}"
-            for item in request.history[-8:]
-            if item.get("content")
-        ]
-        history = "\n".join(history_lines) if history_lines else "Нет истории."
-        return (
-            "Собери одну строку search_text для поиска датасетов по описанию.\n\n"
-            f"История:\n{history}\n\n"
-            f"Запрос пользователя:\n{request.message}\n\n"
-            "Ответь только строкой search_text."
-        )
+        payload = {
+            "type": "query_enricher_structured_input",
+            "task": "build_dataset_search_text",
+            "current_user_message": request.message,
+            "raw_chat_history_forwarded": False,
+            "recent_history_signals": build_recent_history_signals(request.history, limit=8),
+            "output_contract": {
+                "format": "plain_text",
+                "field": "search_text",
+                "no_markdown": True,
+                "no_explanations": True,
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
-    def _parse(raw_output: str, original: str) -> EnrichedQuery:
-        cleaned = raw_output.strip()
+    def _parse(raw_output: object, original: str) -> EnrichedQuery:
+        if isinstance(raw_output, dict):
+            search_text = raw_output.get("search_text")
+            if isinstance(search_text, str) and search_text.strip():
+                return EnrichedQuery(
+                    original=original,
+                    enriched=" ".join(search_text.split()),
+                    metadata={"source": "llm_search_text_tool"},
+                )
+        if hasattr(raw_output, "model_dump"):
+            try:
+                dumped = raw_output.model_dump()
+            except Exception:
+                dumped = None
+            if isinstance(dumped, dict):
+                search_text = dumped.get("search_text")
+                if isinstance(search_text, str) and search_text.strip():
+                    return EnrichedQuery(
+                        original=original,
+                        enriched=" ".join(search_text.split()),
+                        metadata={"source": "llm_search_text_tool"},
+                    )
+
+        cleaned = str(raw_output or "").strip()
         cleaned = re.sub(r"^```(?:text|json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
         cleaned = re.sub(r"^(?:search_text|search text)\s*[:=-]\s*", "", cleaned, flags=re.IGNORECASE)
@@ -62,7 +88,7 @@ class QueryEnricher:
         english_parts: list[str] = []
         enriched_parts = [original]
 
-        if "ввп" in lowered:
+        if "ввп" in lowered or re.search(r"\bgdp\b", lowered):
             english_parts.append("GDP gross domestic product")
             enriched_parts.append("ВВП валовой внутренний продукт GDP gross domestic product макроэкономический показатель")
 
