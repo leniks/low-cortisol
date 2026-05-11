@@ -32,6 +32,7 @@ class QueryEnricher:
             "task": "build_dataset_search_text",
             "current_user_message": request.message,
             "raw_chat_history_forwarded": False,
+            "recent_dialog_context": _recent_dialog_context(request.history),
             "recent_history_signals": build_recent_history_signals(request.history, limit=8),
             "output_contract": {
                 "format": "plain_text",
@@ -116,3 +117,20 @@ def _extract_text_from_json_like(value: str) -> str:
         if match:
             return " ".join(match.group(1).split())
     return ""
+
+
+def _recent_dialog_context(history: tuple[dict[str, object], ...]) -> list[dict[str, object]]:
+    context: list[dict[str, object]] = []
+    for item in history[-6:]:
+        role = str(item.get("role") or "")
+        content = str(item.get("content") or "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        context.append(
+            {
+                "role": role,
+                "content": content[:4000],
+                "truncated": len(content) > 4000,
+            }
+        )
+    return context
